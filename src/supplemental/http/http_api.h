@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 // Copyright 2018 Devolutions <info@devolutions.net>
 //
@@ -96,9 +96,7 @@ extern void *nni_http_conn_get_ctx(nni_http_conn *);
 // These initialization functions create stream for HTTP transactions.
 // They should only be used by the server or client HTTP implementations,
 // and are not for use by other code.
-extern int nni_http_conn_init_tcp(nni_http_conn **, nni_tcp_conn *);
-extern int nni_http_conn_init_tls(
-    nni_http_conn **, struct nng_tls_config *, nni_tcp_conn *);
+extern int nni_http_conn_init(nni_http_conn **, nng_stream *);
 
 extern void nni_http_conn_close(nni_http_conn *);
 extern void nni_http_conn_fini(nni_http_conn *);

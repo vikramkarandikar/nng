@@ -272,28 +272,6 @@ if (NNG_ENABLE_DOC)
 	nng_http_server_stop
     )
 
-    set(NNG_MAN3IPC
-	nng_ipc_close
-	nng_ipc_free
-	nng_ipc_getopt
-	nng_ipc_dialer_alloc
-	nng_ipc_dialer_close
-	nng_ipc_dialer_dial
-	nng_ipc_dialer_free
-	nng_ipc_dialer_getopt
-	nng_ipc_dialer_setopt
-	nng_ipc_listener_accept
-	nng_ipc_listener_alloc
-	nng_ipc_listener_close
-	nng_ipc_listener_free
-	nng_ipc_listener_getopt
-	nng_ipc_listener_listen
-	nng_ipc_listener_setopt
-	nng_ipc_recv
-	nng_ipc_send
-	nng_ipc_setopt
-    )
-
     set(NNG_MAN3SUPP
 	nng_clock
 	nng_cv_alloc
@@ -313,10 +291,16 @@ if (NNG_ENABLE_DOC)
 	nng_thread_destroy
     )
 
+    set(NNG_MAN3STR
+        nng_stream_close
+	nng_stream_free
+	nng_stream_getx
+	nng_stream_recv
+	nng_stream_send
+	nng_stream_set
+    )
+
     set(NNG_MAN3TCP
-	nng_tcp_close
-	nng_tcp_free
-	nng_tcp_getopt
 	nng_tcp_dialer_alloc
 	nng_tcp_dialer_close
 	nng_tcp_dialer_dial
@@ -330,8 +314,6 @@ if (NNG_ENABLE_DOC)
 	nng_tcp_listener_getopt
 	nng_tcp_listener_listen
 	nng_tcp_listener_setopt
-	nng_tcp_recv
-	nng_tcp_send
 	nng_tcp_setopt
     )
 
@@ -438,8 +420,8 @@ if (NNG_ENABLE_DOC)
         nng_man(${F} 3http)
     endforeach()
 
-    foreach(F ${NNG_MAN3IPC})
-        nng_man(${F} 3ipc)
+    foreach(F ${NNG_MAN3STR})
+        nng_man(${F} 3str)
     endforeach()
 
     foreach(F ${NNG_MAN3SUPP})

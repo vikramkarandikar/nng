@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 // Copyright 2018 Devolutions <info@devolutions.net>
 //
@@ -14,6 +14,7 @@
 #include "platform/posix/posix_aio.h"
 
 struct nni_tcp_conn {
+	nng_stream      stream;
 	nni_posix_pfd * pfd;
 	nni_list        readq;
 	nni_list        writeq;
@@ -23,6 +24,9 @@ struct nni_tcp_conn {
 	nni_tcp_dialer *dialer;
 	nni_reap_item   reap;
 };
+
+// Someday we'll enhance the listener & dialer platform code so that we
+// can use the common stream ops.  For now that's in the common code.
 
 struct nni_tcp_dialer {
 	nni_list                connq; // pending connections

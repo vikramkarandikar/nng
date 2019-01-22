@@ -137,22 +137,24 @@ resolv_task(resolv_item *item)
 	if (probe != NULL) {
 		struct sockaddr_in * sin;
 		struct sockaddr_in6 *sin6;
-		nni_sockaddr *       sa = &item->sa;
+		nni_sockaddr         sa;
 
 		switch (probe->ai_addr->sa_family) {
 		case AF_INET:
-			rv                 = 0;
-			sin                = (void *) probe->ai_addr;
-			sa->s_in.sa_family = NNG_AF_INET;
-			sa->s_in.sa_port   = item->port;
-			sa->s_in.sa_addr   = sin->sin_addr.s_addr;
+			rv                = 0;
+			sin               = (void *) probe->ai_addr;
+			sa.s_in.sa_family = NNG_AF_INET;
+			sa.s_in.sa_port   = item->port;
+			sa.s_in.sa_addr   = sin->sin_addr.s_addr;
+			nni_aio_set_sockaddr(item->aio, &sa);
 			break;
 		case AF_INET6:
-			rv                  = 0;
-			sin6                = (void *) probe->ai_addr;
-			sa->s_in6.sa_family = NNG_AF_INET6;
-			sa->s_in6.sa_port   = item->port;
-			memcpy(sa->s_in6.sa_addr, sin6->sin6_addr.s6_addr, 16);
+			rv                 = 0;
+			sin6               = (void *) probe->ai_addr;
+			sa.s_in6.sa_family = NNG_AF_INET6;
+			sa.s_in6.sa_port   = item->port;
+			memcpy(sa.s_in6.sa_addr, sin6->sin6_addr.s6_addr, 16);
+			nni_aio_set_sockaddr(item->aio, &sa);
 			break;
 		}
 	}
@@ -294,10 +296,16 @@ resolv_worker(void *notused)
 
 		// Check to make sure we were not canceled.
 		if ((aio = item->aio) != NULL) {
-			nng_sockaddr *sa = nni_aio_get_input(aio, 0);
+			nng_sockaddr *sa;
 			nni_aio_set_prov_extra(aio, 0, NULL);
 			item->aio = NULL;
-			memcpy(sa, &item->sa, sizeof(*sa));
+
+			// Set the aio sockaddr, and possibly support the
+			// old input path to it.
+
+			if ((sa = nni_aio_get_input(aio, 0)) != NULL) {
+				nni_aio_get_sockaddr(aio, sa);
+			}
 			nni_aio_finish(aio, rv, 0);
 
 			NNI_FREE_STRUCT(item);

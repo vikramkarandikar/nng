@@ -270,7 +270,13 @@ nni_win_tcp_conn_init(nni_tcp_conn **connp, SOCKET s)
 	nni_cv_init(&c->cv, &c->mtx);
 	nni_aio_list_init(&c->recv_aios);
 	nni_aio_list_init(&c->send_aios);
-	c->conn_aio = NULL;
+	c->conn_aio    = NULL;
+	c->ops.s_close = (void *) nni_tcp_conn_close;
+	c->ops.s_free  = (void *) nni_tcp_conn_fini;
+	c->ops.s_send  = (void *) nni_tcp_conn_send;
+	c->ops.s_recv  = (void *) nni_tcp_conn_recv;
+	c->ops.s_getx  = (void *) nni_tcp_conn_getopt;
+	c->ops.s_setx  = (void *) nni_tcp_conn_setopt;
 
 	if (((rv = nni_win_io_init(&c->recv_io, tcp_recv_cb, c)) != 0) ||
 	    ((rv = nni_win_io_init(&c->send_io, tcp_send_cb, c)) != 0) ||

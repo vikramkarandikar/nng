@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 // Copyright 2018 Devolutions <info@devolutions.net>
 //
@@ -287,11 +287,10 @@ extern void nni_tcp_dialer_fini(nni_tcp_dialer *);
 // connection will be aborted.
 extern void nni_tcp_dialer_close(nni_tcp_dialer *);
 
-// nni_tcp_dialer_dial attempts to create an outgoing connection,
-// asynchronously, to the address specified. On success, the first (and only)
+// nni_tcp_dial attempts to create an outgoing connection,
+// asynchronously, to the address in the aio. On success, the first (and only)
 // output will be an nni_tcp_conn * associated with the remote server.
-extern void nni_tcp_dialer_dial(
-    nni_tcp_dialer *, const nni_sockaddr *, nni_aio *);
+extern void nni_tcp_dial(nni_tcp_dialer *, nni_aio *);
 
 // nni_tcp_dialer_getopt gets an option from the dialer.
 extern int nni_tcp_dialer_setopt(
@@ -397,7 +396,7 @@ extern int nni_ipc_conn_getopt(
     nni_ipc_conn *, const char *, void *, size_t *, nni_type);
 
 // nni_ipc_dialer_init creates a new dialer object.
-extern int nni_ipc_dialer_init(nni_ipc_dialer **);
+extern int nni_ipc_dialer_init(nni_ipc_dialer **, const nng_sockaddr *);
 
 // nni_ipc_dialer_fini finalizes the dialer, closing it and freeing
 // all resources.
@@ -411,8 +410,7 @@ extern void nni_ipc_dialer_close(nni_ipc_dialer *);
 // nni_ipc_dialer_dial attempts to create an outgoing connection,
 // asynchronously, to the address specified. On success, the first (and only)
 // output will be an nni_ipc_conn * associated with the remote server.
-extern void nni_ipc_dialer_dial(
-    nni_ipc_dialer *, const nni_sockaddr *, nni_aio *);
+extern void nni_ipc_dialer_dial(nni_ipc_dialer *, nni_aio *);
 
 // nni_ipc_dialer_getopt is used to get options from the dialer.
 // At present there aren't any defined options.
@@ -425,7 +423,7 @@ extern int nni_ipc_dialer_setopt(
     nni_ipc_dialer *, const char *, const void *, size_t, nni_type);
 
 // nni_ipc_listener_init creates a new listener object, unbound.
-extern int nni_ipc_listener_init(nni_ipc_listener **);
+extern int nni_ipc_listener_init(nni_ipc_listener **, const nng_sockaddr *);
 
 // nni_ipc_listener_fini frees the listener and all associated resources.
 // It implictly closes the listener as well.
@@ -437,7 +435,7 @@ extern void nni_ipc_listener_close(nni_ipc_listener *);
 
 // nni_ipc_listener_listen creates the socket in listening mode, bound
 // to the specified address.  Unlike TCP, this address does not change.
-extern int nni_ipc_listener_listen(nni_ipc_listener *, const nni_sockaddr *);
+extern int nni_ipc_listener_listen(nni_ipc_listener *);
 
 // nni_ipc_listener_accept accepts in incoming connect, asynchronously.
 // On success, the first (and only) output will be an nni_ipc_conn *
@@ -456,6 +454,13 @@ extern int nni_ipc_listener_getopt(
 // NNG_OPT_IPC_PERMISSIONS (POSIX).
 extern int nni_ipc_listener_setopt(
     nni_ipc_listener *, const char *, const void *, size_t, nni_type);
+
+// IPC is so different from platform to platform.  The following should
+// be implemented.  If IPC isn't supported, all of these functions should
+// be stubs that just return NNG_ENOTSUP.
+extern int nni_ipc_dialer_alloc(nng_stream_dialer **, const nng_url *);
+extern int nni_ipc_listener_alloc(nng_stream_listener **, const nng_url *);
+extern int nni_ipc_checkopt(const char *, const void *, size_t, nni_type);
 
 //
 // UDP support. UDP is not connection oriented, and only has the notion

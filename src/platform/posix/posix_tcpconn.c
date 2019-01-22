@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 // Copyright 2019 Devolutions <info@devolutions.net>
 //
@@ -529,6 +529,13 @@ nni_posix_tcp_conn_init(nni_tcp_conn **cp, nni_posix_pfd *pfd)
 	nni_mtx_init(&c->mtx);
 	nni_aio_list_init(&c->readq);
 	nni_aio_list_init(&c->writeq);
+
+	c->stream.s_free  = (void *) nni_tcp_conn_fini;
+	c->stream.s_close = (void *) nni_tcp_conn_close;
+	c->stream.s_recv  = (void *) nni_tcp_conn_recv;
+	c->stream.s_send  = (void *) nni_tcp_conn_send;
+	c->stream.s_getx  = (void *) nni_tcp_conn_getopt;
+	c->stream.s_setx  = (void *) nni_tcp_conn_setopt;
 
 	*cp = c;
 	return (0);
