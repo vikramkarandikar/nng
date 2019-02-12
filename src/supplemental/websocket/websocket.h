@@ -56,13 +56,11 @@ extern int  nni_ws_dialer_get_tls(nni_ws_dialer *, nng_tls_config **);
 extern void        nni_ws_send_msg(nni_ws *, nng_aio *);
 extern void        nni_ws_recv_msg(nni_ws *, nng_aio *);
 extern void        nni_ws_close(nni_ws *);
-extern void        nni_ws_close_error(nni_ws *, uint16_t);
 extern void        nni_ws_fini(nni_ws *);
 extern const char *nni_ws_response_headers(nni_ws *);
 extern const char *nni_ws_request_headers(nni_ws *);
-extern int nni_ws_getopt(nni_ws *, const char *, void *, size_t *, nni_type);
-extern int nni_ws_setopt(
-    nni_ws *, const char *, const void *, size_t, nni_type);
+extern int nni_ws_getx(nni_ws *, const char *, void *, size_t *, nni_type);
+extern int nni_ws_setx(nni_ws *, const char *, const void *, size_t, nni_type);
 
 // The implementation will send periodic PINGs, and respond with PONGs.
 

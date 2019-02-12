@@ -31,17 +31,20 @@ typedef struct ws_header {
 } ws_header;
 
 struct nni_ws {
+	nng_stream       ops;
 	nni_list_node    node;
 	nni_reap_item    reap;
 	bool             server;
 	bool             closed;
 	bool             ready;
 	bool             wclose;
+	bool             isstream;
 	nni_mtx          mtx;
-	nni_list         txmsgs;
 	nni_list         rxmsgs;
 	nni_list         sendq;
 	nni_list         recvq;
+	nni_list         txq;
+	nni_list         rxq;
 	ws_frame *       txframe;
 	ws_frame *       rxframe;
 	nni_aio *        txaio; // physical aios
@@ -134,6 +137,7 @@ struct ws_frame {
 	size_t        bufsz; // allocated size
 	uint8_t *     buf;
 	ws_msg *      wmsg;
+	nng_aio *     aio;
 };
 
 struct ws_msg {
@@ -150,6 +154,14 @@ static void ws_conn_cb(void *);
 static void ws_close_cb(void *);
 static void ws_read_cb(void *);
 static void ws_write_cb(void *);
+static void ws_close_error(nni_ws *ws, uint16_t code);
+
+static void ws_str_free(void *);
+static void ws_str_close(void *);
+static void ws_str_send(void *, nng_aio *);
+static void ws_str_recv(void *, nng_aio *);
+static int  ws_str_getx(void *, const char *, void *, size_t *, nni_type);
+static int  ws_str_setx(void *, const char *, const void *, size_t, nni_type);
 
 // This looks, case independently for a word in a list, which is either
 // space or comma separated.
@@ -204,7 +216,7 @@ ws_make_accept(const char *key, char *accept)
 static void
 ws_frame_fini(ws_frame *frame)
 {
-	if (frame->bufsz) {
+	if (frame->bufsz != 0) {
 		nni_free(frame->buf, frame->bufsz);
 	}
 	NNI_FREE_STRUCT(frame);
@@ -263,31 +275,19 @@ ws_unmask_frame(ws_frame *frame)
 
 static int
 ws_msg_init_control(
-    ws_msg **wmp, nni_ws *ws, uint8_t op, const uint8_t *buf, size_t len)
+    ws_frame **framep, nni_ws *ws, uint8_t op, const uint8_t *buf, size_t len)
 {
-	ws_msg *  wm;
 	ws_frame *frame;
 
 	if (len > 125) {
 		return (NNG_EINVAL);
 	}
 
-	if ((wm = NNI_ALLOC_STRUCT(wm)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	wm->buf   = NULL;
-	wm->bufsz = 0;
-
 	if ((frame = NNI_ALLOC_STRUCT(frame)) == NULL) {
-		ws_msg_fini(wm);
 		return (NNG_ENOMEM);
 	}
 
-	NNI_LIST_INIT(&wm->frames, ws_frame, node);
 	memcpy(frame->sdata, buf, len);
-
-	nni_list_append(&wm->frames, frame);
-	frame->wmsg    = wm;
 	frame->len     = len;
 	frame->final   = true;
 	frame->op      = op;
@@ -303,90 +303,88 @@ ws_msg_init_control(
 		ws_mask_frame(frame);
 	}
 
-	wm->aio = NULL;
-	wm->ws  = ws;
-	*wmp    = wm;
+	*framep = frame;
 	return (0);
 }
 
 static int
-ws_msg_init_tx(ws_msg **wmp, nni_ws *ws, nni_msg *msg, nni_aio *aio)
+ws_frame_prep_tx(nni_ws *ws, ws_frame *frame)
 {
-	ws_msg * wm;
+	nng_aio *aio = frame->aio;
+	nni_iov *iov;
+	unsigned niov;
 	size_t   len;
-	size_t   maxfrag = ws->fragsize; // make this tunable. (1MB default)
-	uint8_t *buf;
-	uint8_t  op;
+	char *   buf;
 
-	if ((wm = NNI_ALLOC_STRUCT(wm)) == NULL) {
-		return (NNG_ENOMEM);
+	// Figure out how much we need for the entire aio.
+	frame->len = 0;
+	nni_aio_get_iov(aio, &niov, &iov);
+	for (unsigned i = 0; i < niov; i++) {
+		frame->len += iov[i].iov_len;
 	}
-	NNI_LIST_INIT(&wm->frames, ws_frame, node);
 
-	len       = nni_msg_len(msg) + nni_msg_header_len(msg);
-	wm->bufsz = len;
-	if ((wm->buf = nni_alloc(len)) == NULL) {
-		NNI_FREE_STRUCT(wm);
-		return (NNG_ENOMEM);
+	if (frame->len > ws->fragsize) {
+		// Limit it to a single frame per policy (fragsize), as needed.
+		frame->len   = ws->fragsize;
+		frame->final = false;
+	} else {
+		// It all fits in this frame (which might not be the first),
+		// so we're done.
+		frame->final = true;
 	}
-	buf = wm->buf;
-	memcpy(buf, nni_msg_header(msg), nni_msg_header_len(msg));
-	memcpy(buf + nni_msg_header_len(msg), nni_msg_body(msg),
-	    nni_msg_len(msg));
-
-	op = WS_BINARY; // to start -- no support for sending TEXT frames
-
-	// do ... while because we want at least one frame (even for empty
-	// messages.)   Headers get their own frame, if present.  Best bet
-	// is to try not to have a header when coming here.
-	do {
-		ws_frame *frame;
-
-		if ((frame = NNI_ALLOC_STRUCT(frame)) == NULL) {
-			ws_msg_fini(wm);
+	// Potentially allocate space for the data if we need to.
+	// Note that an empty message is legal.
+	if ((frame->bufsz < frame->len) && (frame->len > 0)) {
+		frame->buf = nni_alloc(frame->len);
+		if (frame->buf == NULL) {
 			return (NNG_ENOMEM);
 		}
-		nni_list_append(&wm->frames, frame);
-		frame->wmsg = wm;
-		frame->len  = len > maxfrag ? maxfrag : len;
-		frame->buf  = buf;
-		frame->op   = op;
+	}
+	buf = frame->buf;
 
-		buf += frame->len;
-		len -= frame->len;
-		op = WS_CONT;
-
-		if (len == 0) {
-			frame->final = true;
+	// Now copy the data into the frame.
+	len = frame->len;
+	while (len != 0) {
+		size_t n = len;
+		if (n > iov->iov_len) {
+			n = iov->iov_len;
 		}
-		frame->head[0] = frame->op;
-		frame->hlen    = 2;
-		if (frame->final) {
-			frame->head[0] |= 0x80; // final frame bit
-		}
-		if (frame->len < 126) {
-			frame->head[1] = frame->len & 0x7f;
-		} else if (frame->len < 65536) {
-			frame->head[1] = 126;
-			NNI_PUT16(frame->head + 2, (frame->len & 0xffff));
-			frame->hlen += 2;
-		} else {
-			frame->head[1] = 127;
-			NNI_PUT64(frame->head + 2, (uint64_t) frame->len);
-			frame->hlen += 8;
-		}
+		memcpy(buf, iov->iov_buf, n);
+		iov++;
+		len -= n;
+		buf += n;
+	}
 
-		if (ws->server) {
-			frame->masked = false;
-		} else {
-			ws_mask_frame(frame);
-		}
+	if (nni_aio_count(aio) == 0) {
+		// This is the first frame.
+		frame->op = WS_BINARY;
+	} else {
+		frame->op = WS_CONT;
+	}
 
-	} while (len);
+	// Populate the frame header.
+	frame->head[0] = frame->op;
+	frame->hlen    = 2;
+	if (frame->final) {
+		frame->head[0] |= 0x80; // final frame bit
+	}
+	if (frame->len < 126) {
+		frame->head[1] = frame->len & 0x7f;
+	} else if (frame->len < 65536) {
+		frame->head[1] = 126;
+		NNI_PUT16(frame->head + 2, (frame->len & 0xffff));
+		frame->hlen += 2;
+	} else {
+		frame->head[1] = 127;
+		NNI_PUT64(frame->head + 2, (uint64_t) frame->len);
+		frame->hlen += 8;
+	}
 
-	wm->aio = aio;
-	wm->ws  = ws;
-	*wmp    = wm;
+	// If we are on the client, then we need to mask the frame.
+	frame->masked = false;
+	if (!ws->server) {
+		ws_mask_frame(frame);
+	}
 	return (0);
 }
 
@@ -408,9 +406,10 @@ ws_msg_init_rx(ws_msg **wmp, nni_ws *ws, nni_aio *aio)
 static void
 ws_close_cb(void *arg)
 {
-	nni_ws * ws = arg;
-	ws_msg * wm;
-	nni_aio *aio;
+	nni_ws *  ws = arg;
+	ws_msg *  wm;
+	ws_frame *frame;
+	nni_aio * aio;
 
 	nni_aio_close(ws->txaio);
 	nni_aio_close(ws->rxaio);
@@ -433,16 +432,14 @@ ws_close_cb(void *arg)
 		ws_msg_fini(wm);
 	}
 
-	while ((wm = nni_list_first(&ws->txmsgs)) != NULL) {
-		nni_list_remove(&ws->txmsgs, wm);
-		if ((aio = wm->aio) != NULL) {
-			wm->aio = NULL;
+	while ((frame = nni_list_first(&ws->txq)) != NULL) {
+		nni_list_remove(&ws->txq, frame);
+		if ((aio = frame->aio) != NULL) {
 			nni_aio_list_remove(aio);
 			nni_aio_finish_error(aio, NNG_ECLOSED);
 		}
-		ws_msg_fini(wm);
+		ws_frame_fini(frame);
 	}
-	ws->txframe = NULL;
 
 	if (ws->rxframe != NULL) {
 		ws_frame_fini(ws->rxframe);
@@ -495,13 +492,11 @@ ws_start_write(nni_ws *ws)
 		return; // busy
 	}
 
-	if ((wm = nni_list_first(&ws->txmsgs)) == NULL) {
-		// Nothing to send.
-		return;
+	if ((frame = nni_list_first(&ws->txq)) == NULL) {
+		return; // nothing to send
 	}
-
-	frame = nni_list_first(&wm->frames);
 	NNI_ASSERT(frame != NULL);
+	nni_list_remove(&ws->txq, frame);
 
 	// Push it out.
 	ws->txframe    = frame;
@@ -534,7 +529,6 @@ ws_write_cb(void *arg)
 {
 	nni_ws *  ws = arg;
 	ws_frame *frame;
-	ws_msg *  wm;
 	nni_aio * aio;
 	int       rv;
 
@@ -545,17 +539,20 @@ ws_write_cb(void *arg)
 		return;
 	}
 	ws->txframe = NULL;
+
 	if (frame->op == WS_CLOSE) {
 		// If this was a close frame, we are done.
 		// No other messages may succeed..
-		while ((wm = nni_list_first(&ws->txmsgs)) != NULL) {
-			nni_list_remove(&ws->txmsgs, wm);
-			if ((aio = wm->aio) != NULL) {
-				wm->aio = NULL;
+		ws->txframe = NULL;
+		ws_frame_fini(frame);
+		while ((frame = nni_list_first(&ws->txq)) != NULL) {
+			nni_list_remove(&ws->txq, frame);
+			if ((aio = frame->aio) != NULL) {
+				frame->aio = NULL;
 				nni_aio_list_remove(aio);
 				nni_aio_finish_error(aio, NNG_ECLOSED);
+				ws_frame_fini(frame);
 			}
-			ws_msg_fini(wm);
 		}
 		if (ws->wclose) {
 			ws->wclose = false;
@@ -565,54 +562,49 @@ ws_write_cb(void *arg)
 		return;
 	}
 
-	wm  = frame->wmsg;
-	aio = wm->aio;
-
+	aio = frame->aio;
 	if ((rv = nni_aio_result(ws->txaio)) != 0) {
-
-		nni_list_remove(&ws->txmsgs, wm);
-		ws_msg_fini(wm);
+		frame->aio = NULL;
 		if (aio != NULL) {
-			wm->aio = NULL;
 			nni_aio_list_remove(aio);
 			nni_aio_finish_error(aio, rv);
 		}
-
+		ws_frame_fini(frame);
 		ws->closed = true;
 		nni_http_conn_close(ws->http);
 		nni_mtx_unlock(&ws->mtx);
 		return;
 	}
 
-	// good frame, was it the last
-	nni_list_remove(&wm->frames, frame);
-	ws_frame_fini(frame);
-
-	// if we still have more frames to transmit, then schedule it.
-	if (!nni_list_empty(&wm->frames)) {
-		ws_start_write(ws);
-		nni_mtx_unlock(&ws->mtx);
-		return;
-	}
-
 	if (aio != NULL) {
-		wm->aio = NULL;
-		nni_aio_list_remove(aio);
+		nni_aio_iov_advance(aio, frame->len);
+		nni_aio_bump_count(aio, frame->len);
+		if (frame->final) {
+			frame->aio = NULL;
+			nni_aio_list_remove(aio);
+		} else {
+			// Clear the aio so that we won't attempt to finish
+			// it outside the lock
+			aio = NULL;
+		}
 	}
-	nni_list_remove(&ws->txmsgs, wm);
 
-	// Write the next frame.
+	if (frame->final) {
+		ws_frame_fini(frame);
+	} else {
+		// This one cannot fail here, since we only do allocation
+		// at initial scheduling.
+		ws_frame_prep_tx(ws, frame);
+		// Schedule at end.  This permits other frames to interleave.
+		nni_list_append(&ws->txq, frame);
+	}
+
 	ws_start_write(ws);
 	nni_mtx_unlock(&ws->mtx);
 
-	// discard while not holding lock (just deallocations)
-	ws_msg_fini(wm);
-
+	// We attempt to finish the operation synchronously, outside the lock.
 	if (aio != NULL) {
-		nng_msg *msg = nni_aio_get_msg(aio);
-		nni_aio_set_msg(aio, NULL);
-		nni_aio_finish_synch(aio, 0, nni_msg_len(msg));
-		nni_msg_free(msg);
+		nni_aio_finish_synch(aio, 0, nni_aio_count(aio));
 	}
 }
 
@@ -620,7 +612,6 @@ static void
 ws_write_cancel(nni_aio *aio, void *arg, int rv)
 {
 	nni_ws *  ws = arg;
-	ws_msg *  wm;
 	ws_frame *frame;
 
 	// Is this aio active?  We can tell by looking at the active tx frame.
@@ -630,17 +621,17 @@ ws_write_cancel(nni_aio *aio, void *arg, int rv)
 		nni_mtx_unlock(&ws->mtx);
 		return;
 	}
-	wm = nni_aio_get_prov_extra(aio, 0);
-	if (((frame = ws->txframe) != NULL) && (frame->wmsg == wm)) {
+	frame = nni_aio_get_prov_extra(aio, 0);
+	if (frame == ws->txframe) {
 		nni_aio_abort(ws->txaio, rv);
 		// We will wait for callback on the txaio to finish aio.
-	} else if (nni_list_active(&ws->txmsgs, wm)) {
+	} else {
 		// If scheduled, just need to remove node and complete it.
-		nni_list_remove(&ws->txmsgs, wm);
-		wm->aio = NULL;
+		nni_list_remove(&ws->txq, frame);
+		frame->aio = NULL;
 		nni_aio_list_remove(aio);
 		nni_aio_finish_error(aio, rv);
-		ws_msg_fini(wm);
+		ws_frame_fini(frame);
 	}
 	nni_mtx_unlock(&ws->mtx);
 }
@@ -648,10 +639,10 @@ ws_write_cancel(nni_aio *aio, void *arg, int rv)
 static void
 ws_send_close(nni_ws *ws, uint16_t code)
 {
-	ws_msg * wm;
-	uint8_t  buf[sizeof(uint16_t)];
-	int      rv;
-	nni_aio *aio;
+	ws_frame *frame;
+	uint8_t   buf[sizeof(uint16_t)];
+	int       rv;
+	nni_aio * aio;
 
 	NNI_PUT16(buf, code);
 
@@ -665,37 +656,38 @@ ws_send_close(nni_ws *ws, uint16_t code)
 		return;
 	}
 	ws->wclose = true;
-	rv         = ws_msg_init_control(&wm, ws, WS_CLOSE, buf, sizeof(buf));
+	rv = ws_msg_init_control(&frame, ws, WS_CLOSE, buf, sizeof(buf));
 	if (rv != 0) {
 		ws->wclose = false;
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
-	// Close frames get priority!
 	if ((rv = nni_aio_schedule(aio, ws_cancel_close, ws)) != 0) {
 		ws->wclose = false;
 		nni_aio_finish_error(aio, rv);
+		ws_frame_fini(frame);
 		return;
 	}
-	nni_list_prepend(&ws->txmsgs, wm);
+	// This gets inserted at the head.
+	nni_list_prepend(&ws->txq, frame);
 	ws_start_write(ws);
 }
 
 static void
 ws_send_control(nni_ws *ws, uint8_t op, uint8_t *buf, size_t len)
 {
-	ws_msg *wm;
+	ws_frame *frame;
 
 	// Note that we do not care if this works or not.  So no AIO needed.
 
 	if ((ws->closed) ||
-	    (ws_msg_init_control(&wm, ws, op, buf, len) != 0)) {
+	    (ws_msg_init_control(&frame, ws, op, buf, len) != 0)) {
 		return;
 	}
 
 	// Control frames at head of list.  (Note that this may preempt
 	// the close frame or other ping/pong requests.  Oh well.)
-	nni_list_prepend(&ws->txmsgs, wm);
+	nni_list_prepend(&ws->txq, frame);
 	ws_start_write(ws);
 }
 
@@ -706,7 +698,25 @@ static const nni_option ws_options[] = {
 };
 
 int
-nni_ws_getopt(nni_ws *ws, const char *name, void *buf, size_t *szp, nni_type t)
+nni_ws_setx(nni_ws *ws, const char *nm, const void *buf, size_t sz, nni_type t)
+{
+	int rv;
+
+	nni_mtx_lock(&ws->mtx);
+	if (ws->closed) {
+		nni_mtx_unlock(&ws->mtx);
+		return (NNG_ECLOSED);
+	}
+	rv = nni_http_conn_setopt(ws->http, nm, buf, sz, t);
+	if (rv == NNG_ENOTSUP) {
+		rv = nni_setopt(ws_options, nm, ws, buf, sz, t);
+	}
+	nni_mtx_unlock(&ws->mtx);
+	return (rv);
+}
+
+int
+nni_ws_getx(nni_ws *ws, const char *name, void *buf, size_t *szp, nni_type t)
 {
 	int rv;
 
@@ -723,58 +733,63 @@ nni_ws_getopt(nni_ws *ws, const char *name, void *buf, size_t *szp, nni_type t)
 	return (rv);
 }
 
-int
-nni_ws_setopt(
-    nni_ws *ws, const char *name, const void *buf, size_t sz, nni_type t)
-{
-	int rv;
-
-	nni_mtx_lock(&ws->mtx);
-	if (ws->closed) {
-		nni_mtx_unlock(&ws->mtx);
-		return (NNG_ECLOSED);
-	}
-	rv = nni_http_conn_setopt(ws->http, name, buf, sz, t);
-	if (rv == NNG_ENOTSUP) {
-		rv = nni_setopt(ws_options, name, ws, buf, sz, t);
-	}
-	nni_mtx_unlock(&ws->mtx);
-	return (rv);
-}
-
 void
 nni_ws_send_msg(nni_ws *ws, nni_aio *aio)
 {
-	ws_msg * wm;
-	nni_msg *msg;
-	int      rv;
+	ws_msg *  wm;
+	nni_msg * msg;
+	int       rv;
+	nni_iov   iov[2];
+	int       niov;
+	ws_frame *frame;
 
 	msg = nni_aio_get_msg(aio);
+
+	niov = 0;
+	if (nng_msg_header_len(msg) > 0) {
+		iov[niov].iov_len = nng_msg_header_len(msg);
+		iov[niov].iov_buf = nng_msg_header(msg);
+		niov++;
+	}
+	iov[niov].iov_len = nng_msg_len(msg);
+	iov[niov].iov_buf = nng_msg_body(msg);
+	niov++;
+
+	// We borrow the niov for the user's data.  They gave us a message, so
+	// they shouldn't be using the iov.
+	nni_aio_set_iov(aio, niov, iov);
 
 	if (nni_aio_begin(aio) != 0) {
 		return;
 	}
-	if ((rv = ws_msg_init_tx(&wm, ws, msg, aio)) != 0) {
+	if ((frame = NNI_ALLOC_STRUCT(frame)) == NULL) {
+		nni_aio_finish_error(aio, NNG_ENOMEM);
+		return;
+	}
+	frame->aio = aio;
+	if ((rv = ws_frame_prep_tx(ws, frame)) != 0) {
 		nni_aio_finish_error(aio, rv);
+		ws_frame_fini(frame);
 		return;
 	}
 
 	nni_mtx_lock(&ws->mtx);
+
 	if (ws->closed) {
 		nni_mtx_unlock(&ws->mtx);
 		nni_aio_finish_error(aio, NNG_ECLOSED);
-		ws_msg_fini(wm);
+		ws_frame_fini(frame);
 		return;
 	}
 	if ((rv = nni_aio_schedule(aio, ws_write_cancel, ws)) != 0) {
 		nni_mtx_unlock(&ws->mtx);
 		nni_aio_finish_error(aio, rv);
-		ws_msg_fini(wm);
+		ws_frame_fini(frame);
 		return;
 	}
-	nni_aio_set_prov_extra(aio, 0, wm);
+	nni_aio_set_prov_extra(aio, 0, frame);
 	nni_list_append(&ws->sendq, aio);
-	nni_list_append(&ws->txmsgs, wm);
+	nni_list_append(&ws->txq, frame);
 	ws_start_write(ws);
 	nni_mtx_unlock(&ws->mtx);
 }
@@ -1042,7 +1057,7 @@ ws_read_cb(void *arg)
 		if ((rv = nni_msg_alloc(&msg, len)) != 0) {
 			nni_aio_finish_error(aio, rv);
 			ws_msg_fini(wm);
-			nni_ws_close_error(ws, WS_CLOSE_INTERNAL);
+			ws_close_error(ws, WS_CLOSE_INTERNAL);
 			return;
 		}
 		body = nni_msg_body(msg);
@@ -1108,8 +1123,8 @@ nni_ws_recv_msg(nni_ws *ws, nni_aio *aio)
 	nni_mtx_unlock(&ws->mtx);
 }
 
-void
-nni_ws_close_error(nni_ws *ws, uint16_t code)
+static void
+ws_close_error(nni_ws *ws, uint16_t code)
 {
 	nni_mtx_lock(&ws->mtx);
 	ws_close(ws, code);
@@ -1119,7 +1134,7 @@ nni_ws_close_error(nni_ws *ws, uint16_t code)
 void
 nni_ws_close(nni_ws *ws)
 {
-	nni_ws_close_error(ws, WS_CLOSE_NORMAL_CLOSE);
+	ws_close_error(ws, WS_CLOSE_NORMAL_CLOSE);
 }
 
 const char *
@@ -1147,8 +1162,9 @@ nni_ws_response_headers(nni_ws *ws)
 static void
 ws_fini(void *arg)
 {
-	nni_ws *ws = arg;
-	ws_msg *wm;
+	nni_ws *  ws = arg;
+	ws_msg *  wm;
+	ws_frame *frame;
 
 	nni_ws_close(ws);
 
@@ -1183,12 +1199,13 @@ ws_fini(void *arg)
 		ws_msg_fini(wm);
 	}
 
-	while ((wm = nni_list_first(&ws->txmsgs)) != NULL) {
-		nni_list_remove(&ws->txmsgs, wm);
-		if (wm->aio) {
-			nni_aio_finish_error(wm->aio, NNG_ECLOSED);
+	while ((frame = nni_list_first(&ws->txq)) != NULL) {
+		nni_list_remove(&ws->txq, frame);
+		if (frame->aio != NULL) {
+			nni_aio_list_remove(frame->aio);
+			nni_aio_finish_error(frame->aio, NNG_ECLOSED);
 		}
-		ws_msg_fini(wm);
+		ws_frame_fini(frame);
 	}
 
 	if (ws->rxframe) {
@@ -1215,12 +1232,6 @@ ws_fini(void *arg)
 	nni_aio_fini(ws->connaio);
 	nni_mtx_fini(&ws->mtx);
 	NNI_FREE_STRUCT(ws);
-}
-
-void
-nni_ws_fini(nni_ws *ws)
-{
-	nni_reap(&ws->reap, ws_fini, ws);
 }
 
 static void
@@ -1320,14 +1331,14 @@ ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
 	    (!ws_contains_word(ptr, "upgrade")) ||
 	    ((ptr = GETH("Upgrade")) == NULL) ||
 	    (strcmp(ptr, "websocket") != 0)) {
-		nni_ws_close_error(ws, WS_CLOSE_PROTOCOL_ERR);
+		ws_close_error(ws, WS_CLOSE_PROTOCOL_ERR);
 		rv = NNG_EPROTO;
 		goto err;
 	}
 	if (d->proto != NULL) {
 		if (((ptr = GETH("Sec-WebSocket-Protocol")) == NULL) ||
 		    (!ws_contains_word(d->proto, ptr))) {
-			nni_ws_close_error(ws, WS_CLOSE_PROTOCOL_ERR);
+			ws_close_error(ws, WS_CLOSE_PROTOCOL_ERR);
 			rv = NNG_EPROTO;
 			goto err;
 		}
@@ -1385,7 +1396,7 @@ ws_init(nni_ws **wsp)
 	}
 	nni_mtx_init(&ws->mtx);
 	NNI_LIST_INIT(&ws->rxmsgs, ws_msg, node);
-	NNI_LIST_INIT(&ws->txmsgs, ws_msg, node);
+	NNI_LIST_INIT(&ws->txq, ws_frame, node);
 	nni_aio_list_init(&ws->sendq);
 	nni_aio_list_init(&ws->recvq);
 
@@ -1400,6 +1411,15 @@ ws_init(nni_ws **wsp)
 
 	nni_aio_set_timeout(ws->closeaio, 100);
 	nni_aio_set_timeout(ws->httpaio, 2000);
+
+	ws->ops.s_close = ws_str_close;
+	ws->ops.s_free  = ws_str_free;
+#if 0
+	ws->ops.s_send  = ws_str_send;
+	ws->ops.s_recv  = ws_str_recv;
+	ws->ops.s_getx  = ws_str_getx;
+	ws->ops.s_setx  = ws_str_setx;
+#endif
 
 	ws->fragsize = 1 << 20; // we won't send a frame larger than this
 	*wsp         = ws;
@@ -1733,10 +1753,10 @@ nni_ws_listener_close(nni_ws_listener *l)
 		l->started = false;
 	}
 	NNI_LIST_FOREACH (&l->pend, ws) {
-		nni_ws_close_error(ws, WS_CLOSE_GOING_AWAY);
+		ws_close_error(ws, WS_CLOSE_GOING_AWAY);
 	}
 	NNI_LIST_FOREACH (&l->reply, ws) {
-		nni_ws_close_error(ws, WS_CLOSE_GOING_AWAY);
+		ws_close_error(ws, WS_CLOSE_GOING_AWAY);
 	}
 	nni_mtx_unlock(&l->mtx);
 }
@@ -2130,3 +2150,37 @@ nni_ws_dialer_set_maxframe(nni_ws_dialer *d, size_t maxframe)
 
 // The implementation will send periodic PINGs, and respond with
 // PONGs.
+
+void
+nni_ws_fini(nni_ws *ws)
+{
+	nni_reap(&ws->reap, ws_fini, ws);
+}
+
+static void
+ws_str_free(void *arg)
+{
+	nni_ws *ws = arg;
+	nni_ws_fini(ws);
+}
+
+static void
+ws_str_close(void *arg)
+{
+	nni_ws *ws = arg;
+	nni_ws_close(ws);
+}
+
+static int
+ws_str_setx(void *arg, const char *nm, const void *buf, size_t sz, nni_type t)
+{
+	nni_ws *ws = arg;
+	return (nni_ws_setx(ws, nm, buf, sz, t));
+}
+
+static int
+ws_str_getx(void *arg, const char *nm, void *buf, size_t *szp, nni_type t)
+{
+	nni_ws *ws = arg;
+	return (nni_ws_getx(ws, nm, buf, szp, t));
+}

@@ -622,7 +622,7 @@ ws_pipe_getopt(void *arg, const char *name, void *buf, size_t *szp, nni_type t)
 	ws_pipe *p = arg;
 	int      rv;
 
-	if ((rv = nni_ws_getopt(p->ws, name, buf, szp, t)) == NNG_ENOTSUP) {
+	if ((rv = nni_ws_getx(p->ws, name, buf, szp, t)) == NNG_ENOTSUP) {
 		rv = nni_getopt(ws_pipe_options, name, p, buf, szp, t);
 	}
 	return (rv);
