@@ -1,7 +1,7 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
-// Copyright 2018 Devolutions <info@devolutions.net>
+// Copyright 2019 Devolutions <info@devolutions.net>
 //
 // This software is supplied under the terms of the MIT License, a
 // copy of which should be located in the distribution where this
@@ -22,7 +22,6 @@
 
 // Pre-defined types for some prototypes.  These are from other subsystems.
 typedef struct ws_frame ws_frame;
-typedef struct ws_msg   ws_msg;
 
 typedef struct ws_header {
 	nni_list_node node;
@@ -39,8 +38,8 @@ struct nni_ws {
 	bool             ready;
 	bool             wclose;
 	bool             isstream;
+	bool             inmsg;
 	nni_mtx          mtx;
-	nni_list         rxmsgs;
 	nni_list         sendq;
 	nni_list         recvq;
 	nni_list         txq;
@@ -136,17 +135,7 @@ struct ws_frame {
 	bool          masked;
 	size_t        bufsz; // allocated size
 	uint8_t *     buf;
-	ws_msg *      wmsg;
 	nng_aio *     aio;
-};
-
-struct ws_msg {
-	nni_list      frames;
-	nni_list_node node;
-	nni_ws *      ws;
-	nni_aio *     aio;
-	uint8_t *     buf;
-	size_t        bufsz;
 };
 
 static void ws_send_close(nni_ws *ws, uint16_t code);
@@ -220,23 +209,6 @@ ws_frame_fini(ws_frame *frame)
 		nni_free(frame->buf, frame->bufsz);
 	}
 	NNI_FREE_STRUCT(frame);
-}
-
-static void
-ws_msg_fini(ws_msg *wm)
-{
-	ws_frame *frame;
-
-	NNI_ASSERT(!nni_list_node_active(&wm->node));
-	while ((frame = nni_list_first(&wm->frames)) != NULL) {
-		nni_list_remove(&wm->frames, frame);
-		ws_frame_fini(frame);
-	}
-	if (wm->bufsz != 0) {
-		nni_free(wm->buf, wm->bufsz);
-	}
-
-	NNI_FREE_STRUCT(wm);
 }
 
 static void
@@ -314,7 +286,7 @@ ws_frame_prep_tx(nni_ws *ws, ws_frame *frame)
 	nni_iov *iov;
 	unsigned niov;
 	size_t   len;
-	char *   buf;
+	uint8_t *buf;
 
 	// Figure out how much we need for the entire aio.
 	frame->len = 0;
@@ -388,26 +360,10 @@ ws_frame_prep_tx(nni_ws *ws, ws_frame *frame)
 	return (0);
 }
 
-static int
-ws_msg_init_rx(ws_msg **wmp, nni_ws *ws, nni_aio *aio)
-{
-	ws_msg *wm;
-
-	if ((wm = NNI_ALLOC_STRUCT(wm)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	NNI_LIST_INIT(&wm->frames, ws_frame, node);
-	wm->aio = aio;
-	wm->ws  = ws;
-	*wmp    = wm;
-	return (0);
-}
-
 static void
 ws_close_cb(void *arg)
 {
 	nni_ws *  ws = arg;
-	ws_msg *  wm;
 	ws_frame *frame;
 	nni_aio * aio;
 
@@ -421,17 +377,6 @@ ws_close_cb(void *arg)
 
 	nni_http_conn_close(ws->http);
 
-	// This list (receive) should be empty.
-	while ((wm = nni_list_first(&ws->rxmsgs)) != NULL) {
-		nni_list_remove(&ws->rxmsgs, wm);
-		if ((aio = wm->aio) != NULL) {
-			wm->aio = NULL;
-			nni_aio_list_remove(aio);
-			nni_aio_finish_error(aio, NNG_ECLOSED);
-		}
-		ws_msg_fini(wm);
-	}
-
 	while ((frame = nni_list_first(&ws->txq)) != NULL) {
 		nni_list_remove(&ws->txq, frame);
 		if ((aio = frame->aio) != NULL) {
@@ -441,11 +386,6 @@ ws_close_cb(void *arg)
 		ws_frame_fini(frame);
 	}
 
-	if (ws->rxframe != NULL) {
-		ws_frame_fini(ws->rxframe);
-		ws->rxframe = NULL;
-	}
-
 	// Any txframe should have been killed with its wmsg.
 	nni_mtx_unlock(&ws->mtx);
 }
@@ -453,19 +393,13 @@ ws_close_cb(void *arg)
 static void
 ws_close(nni_ws *ws, uint16_t code)
 {
-	ws_msg *wm;
+	nng_aio *aio;
 
 	// Receive stuff gets aborted always.  No further receives
 	// once we get a close.
-	while ((wm = nni_list_first(&ws->rxmsgs)) != NULL) {
-		nni_aio *aio;
-		nni_list_remove(&ws->rxmsgs, wm);
-		if ((aio = wm->aio) != NULL) {
-			wm->aio = NULL;
-			nni_aio_list_remove(aio);
-			nni_aio_finish_error(aio, NNG_ECLOSED);
-		}
-		ws_msg_fini(wm);
+	while ((aio = nni_list_first(&ws->recvq)) != NULL) {
+		nni_aio_list_remove(aio);
+		nni_aio_finish_error(aio, NNG_ECLOSED);
 	}
 
 	// If were closing "gracefully", then don't abort in-flight
@@ -484,7 +418,6 @@ static void
 ws_start_write(nni_ws *ws)
 {
 	ws_frame *frame;
-	ws_msg *  wm;
 	nni_iov   iov[2];
 	int       niov;
 
@@ -736,7 +669,6 @@ nni_ws_getx(nni_ws *ws, const char *name, void *buf, size_t *szp, nni_type t)
 void
 nni_ws_send_msg(nni_ws *ws, nni_aio *aio)
 {
-	ws_msg *  wm;
 	nni_msg * msg;
 	int       rv;
 	nni_iov   iov[2];
@@ -798,7 +730,6 @@ static void
 ws_start_read(nni_ws *ws)
 {
 	ws_frame *frame;
-	ws_msg *  wm;
 	nni_aio * aio;
 	nni_iov   iov;
 
@@ -806,18 +737,18 @@ ws_start_read(nni_ws *ws)
 		return; // already reading or closed
 	}
 
-	if ((wm = nni_list_first(&ws->rxmsgs)) == NULL) {
-		return; // no body expecting a message.
+	// If nobody is waiting for recv, and we already have a data
+	// frame, stop reading.  This keeps us from buffering infinitely.
+	if (nni_list_empty(&ws->recvq) && !nni_list_empty(&ws->rxq)) {
+		return;
 	}
 
 	if ((frame = NNI_ALLOC_STRUCT(frame)) == NULL) {
-		nni_list_remove(&ws->rxmsgs, wm);
-		if ((aio = wm->aio) != NULL) {
-			wm->aio = NULL;
+		if ((aio = nni_list_first(&ws->recvq)) != NULL) {
 			nni_aio_list_remove(aio);
 			nni_aio_finish_error(aio, NNG_ENOMEM);
 		}
-		ws_msg_fini(wm);
+		ws_close(ws, WS_CLOSE_INTERNAL);
 		return;
 	}
 
@@ -835,34 +766,135 @@ ws_start_read(nni_ws *ws)
 }
 
 static void
-ws_read_frame_cb(nni_ws *ws, ws_frame *frame, ws_msg **wmp, nni_aio **aiop)
+ws_read_finish_str(nni_ws *ws)
 {
-	ws_msg *wm = nni_list_first(&ws->rxmsgs);
+	for (;;) {
+		nni_aio * aio;
+		nni_iov * iov;
+		unsigned  niov;
+		ws_frame *frame;
 
+		if ((aio = nni_list_first(&ws->recvq)) == NULL) {
+			return;
+		}
+
+		if ((frame = nni_list_first(&ws->rxq)) == NULL) {
+			return;
+		}
+
+		// Discard 0 length frames -- in stream mode they are not used.
+		if (frame->len == 0) {
+			nni_list_remove(&ws->rxq, frame);
+			ws_frame_fini(frame);
+			continue;
+		}
+
+		// We are completing this aio one way or the other.
+		nni_aio_list_remove(aio);
+		nni_aio_get_iov(aio, &niov, &iov);
+
+		while ((frame != NULL) && (niov != 0)) {
+			size_t n;
+			if (niov == 0) {
+				break;
+			}
+			if ((n = frame->len) > iov->iov_len) {
+				// This eats the entire iov.
+				n = iov->iov_len;
+			}
+			iov->iov_buf = ((uint8_t *) iov->iov_buf) + n;
+			iov->iov_len -= n;
+			if (iov->iov_len == 0) {
+				iov++;
+				niov--;
+			}
+
+			if (frame->len == n) {
+				nni_list_remove(&ws->rxq, frame);
+				ws_frame_fini(frame);
+				frame = nni_list_first(&ws->rxq);
+			} else {
+				frame->len -= n;
+				frame->buf += n;
+			}
+
+			nni_aio_bump_count(aio, n);
+		}
+
+		nni_aio_finish(aio, 0, nni_aio_count(aio));
+	}
+}
+
+static void
+ws_read_finish_msg(nni_ws *ws)
+{
+	nni_aio * aio;
+	size_t    len;
+	ws_frame *frame;
+	nni_msg * msg;
+	int       rv;
+	uint8_t * body;
+
+	// If we have no data, no waiter, or have not received the complete
+	// message yet, then there is nothing to do.
+	if (ws->inmsg || nni_list_empty(&ws->rxq) ||
+	    ((aio = nni_list_first(&ws->recvq)) == NULL)) {
+		return;
+	}
+
+	// At this point, we have both a complete message in the queue (and
+	// there should not be any frames other than the for the message),
+	// and a waiting reader.
+	len = 0;
+	NNI_LIST_FOREACH (&ws->rxq, frame) {
+		len += frame->len;
+	}
+
+	nni_aio_list_remove(aio);
+
+	if ((rv = nni_msg_alloc(&msg, len)) != 0) {
+		nni_aio_finish_error(aio, rv);
+		ws_close_error(ws, WS_CLOSE_INTERNAL);
+		return;
+	}
+	body = nni_msg_body(msg);
+	while ((frame = nni_list_first(&ws->rxq)) != NULL) {
+		nni_list_remove(&ws->rxq, frame);
+		memcpy(body, frame->buf, frame->len);
+		body += frame->len;
+		ws_frame_fini(frame);
+	}
+
+	nni_aio_set_msg(aio, msg);
+	nni_aio_bump_count(aio, nni_msg_len(msg));
+	nni_aio_finish(aio, 0, nni_msg_len(msg));
+}
+
+static void
+ws_read_frame_cb(nni_ws *ws, ws_frame *frame)
+{
 	switch (frame->op) {
 	case WS_CONT:
-		if (wm == NULL) {
-			ws_close(ws, WS_CLOSE_GOING_AWAY);
-			return;
-		}
-		if (nni_list_empty(&wm->frames)) {
+		if (!ws->inmsg) {
 			ws_close(ws, WS_CLOSE_PROTOCOL_ERR);
 			return;
 		}
+		if (frame->final) {
+			ws->inmsg = false;
+		}
 		ws->rxframe = NULL;
-		nni_list_append(&wm->frames, frame);
+		nni_list_append(&ws->rxq, frame);
 		break;
 	case WS_BINARY:
-		if (wm == NULL) {
-			ws_close(ws, WS_CLOSE_GOING_AWAY);
-			return;
-		}
-		if (!nni_list_empty(&wm->frames)) {
+		if (ws->inmsg) {
 			ws_close(ws, WS_CLOSE_PROTOCOL_ERR);
 			return;
 		}
+		if (!frame->final) {
+			ws->inmsg = true;
+		}
 		ws->rxframe = NULL;
-		nni_list_append(&wm->frames, frame);
+		nni_list_append(&ws->rxq, frame);
 		break;
 	case WS_TEXT:
 		// No support for text mode at present.
@@ -895,23 +927,17 @@ ws_read_frame_cb(nni_ws *ws, ws_frame *frame, ws_msg **wmp, nni_aio **aiop)
 		return;
 	}
 
-	// If this was the last (final) frame, then complete it.  But
-	// we have to look at the msg, since we might have got a
-	// control frame.
-	if (((frame = nni_list_last(&wm->frames)) != NULL) && frame->final) {
-		nni_list_remove(&ws->rxmsgs, wm);
-		*wmp  = wm;
-		*aiop = wm->aio;
-		nni_aio_list_remove(wm->aio);
-		wm->aio = NULL;
+	if (ws->isstream) {
+		ws_read_finish_str(ws);
+	} else {
+		ws_read_finish_msg(ws);
 	}
 }
 
 static void
 ws_read_cb(void *arg)
 {
-	nni_ws *  ws = arg;
-	ws_msg *  wm;
+	nni_ws *  ws  = arg;
 	nni_aio * aio = ws->rxaio;
 	ws_frame *frame;
 	int       rv;
@@ -1038,57 +1064,18 @@ ws_read_cb(void *arg)
 	// At this point, we have a complete frame.
 	ws_unmask_frame(frame); // idempotent
 
-	wm  = NULL;
-	aio = NULL;
-	ws_read_frame_cb(ws, frame, &wm, &aio);
+	ws_read_frame_cb(ws, frame);
 	ws_start_read(ws);
 	nni_mtx_unlock(&ws->mtx);
-
-	// Got a good message, so we have to do the work to send it up.
-	if (wm != NULL) {
-		size_t   len = 0;
-		nni_msg *msg;
-		uint8_t *body;
-		int      rv;
-
-		NNI_LIST_FOREACH (&wm->frames, frame) {
-			len += frame->len;
-		}
-		if ((rv = nni_msg_alloc(&msg, len)) != 0) {
-			nni_aio_finish_error(aio, rv);
-			ws_msg_fini(wm);
-			ws_close_error(ws, WS_CLOSE_INTERNAL);
-			return;
-		}
-		body = nni_msg_body(msg);
-		NNI_LIST_FOREACH (&wm->frames, frame) {
-			memcpy(body, frame->buf, frame->len);
-			body += frame->len;
-		}
-		nni_aio_set_msg(aio, msg);
-		nni_aio_finish_synch(aio, 0, nni_msg_len(msg));
-		ws_msg_fini(wm);
-	}
 }
 
 static void
 ws_read_cancel(nni_aio *aio, void *arg, int rv)
 {
 	nni_ws *ws = arg;
-	ws_msg *wm;
 
 	nni_mtx_lock(&ws->mtx);
-	if (!nni_aio_list_active(aio)) {
-		nni_mtx_unlock(&ws->mtx);
-		return;
-	}
-	wm = nni_aio_get_prov_extra(aio, 0);
-	if (wm == nni_list_first(&ws->rxmsgs)) {
-		// Cancellation will percolate back up.
-		nni_aio_abort(ws->rxaio, rv);
-	} else if (nni_list_active(&ws->rxmsgs, wm)) {
-		nni_list_remove(&ws->rxmsgs, wm);
-		ws_msg_fini(wm);
+	if (nni_aio_list_active(aio)) {
 		nni_aio_list_remove(aio);
 		nni_aio_finish_error(aio, rv);
 	}
@@ -1098,26 +1085,18 @@ ws_read_cancel(nni_aio *aio, void *arg, int rv)
 void
 nni_ws_recv_msg(nni_ws *ws, nni_aio *aio)
 {
-	ws_msg *wm;
-	int     rv;
+	int rv;
 
 	if (nni_aio_begin(aio) != 0) {
-		return;
-	}
-	if ((rv = ws_msg_init_rx(&wm, ws, aio)) != 0) {
-		nni_aio_finish_error(aio, rv);
 		return;
 	}
 	nni_mtx_lock(&ws->mtx);
 	if ((rv = nni_aio_schedule(aio, ws_read_cancel, ws)) != 0) {
 		nni_mtx_unlock(&ws->mtx);
-		ws_msg_fini(wm);
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
-	nni_aio_set_prov_extra(aio, 0, wm);
 	nni_list_append(&ws->recvq, aio);
-	nni_list_append(&ws->rxmsgs, wm);
 	ws_start_read(ws);
 
 	nni_mtx_unlock(&ws->mtx);
@@ -1163,8 +1142,8 @@ static void
 ws_fini(void *arg)
 {
 	nni_ws *  ws = arg;
-	ws_msg *  wm;
 	ws_frame *frame;
+	nng_aio * aio;
 
 	nni_ws_close(ws);
 
@@ -1191,26 +1170,29 @@ ws_fini(void *arg)
 	}
 
 	nni_mtx_lock(&ws->mtx);
-	while ((wm = nni_list_first(&ws->rxmsgs)) != NULL) {
-		nni_list_remove(&ws->rxmsgs, wm);
-		if (wm->aio) {
-			nni_aio_finish_error(wm->aio, NNG_ECLOSED);
-		}
-		ws_msg_fini(wm);
+	while ((frame = nni_list_first(&ws->rxq)) != NULL) {
+		nni_list_remove(&ws->rxq, frame);
+		ws_frame_fini(frame);
 	}
 
 	while ((frame = nni_list_first(&ws->txq)) != NULL) {
 		nni_list_remove(&ws->txq, frame);
-		if (frame->aio != NULL) {
-			nni_aio_list_remove(frame->aio);
-			nni_aio_finish_error(frame->aio, NNG_ECLOSED);
-		}
 		ws_frame_fini(frame);
 	}
 
-	if (ws->rxframe) {
+	if (ws->rxframe != NULL) {
 		ws_frame_fini(ws->rxframe);
 	}
+	if (ws->txframe != NULL) {
+		ws_frame_fini(ws->txframe);
+	}
+
+	while (((aio = nni_list_first(&ws->recvq)) != NULL) ||
+	    ((aio = nni_list_first(&ws->sendq)) != NULL)) {
+		nni_aio_list_remove(aio);
+		nni_aio_finish_error(aio, NNG_ECLOSED);
+	}
+
 	nni_mtx_unlock(&ws->mtx);
 
 	if (ws->http) {
@@ -1395,7 +1377,7 @@ ws_init(nni_ws **wsp)
 		return (NNG_ENOMEM);
 	}
 	nni_mtx_init(&ws->mtx);
-	NNI_LIST_INIT(&ws->rxmsgs, ws_msg, node);
+	NNI_LIST_INIT(&ws->rxq, ws_frame, node);
 	NNI_LIST_INIT(&ws->txq, ws_frame, node);
 	nni_aio_list_init(&ws->sendq);
 	nni_aio_list_init(&ws->recvq);
@@ -1417,9 +1399,9 @@ ws_init(nni_ws **wsp)
 #if 0
 	ws->ops.s_send  = ws_str_send;
 	ws->ops.s_recv  = ws_str_recv;
-	ws->ops.s_getx  = ws_str_getx;
-	ws->ops.s_setx  = ws_str_setx;
 #endif
+	ws->ops.s_getx = ws_str_getx;
+	ws->ops.s_setx = ws_str_setx;
 
 	ws->fragsize = 1 << 20; // we won't send a frame larger than this
 	*wsp         = ws;
