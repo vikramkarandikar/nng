@@ -17,6 +17,7 @@
 
 #include "core/tcp.h"
 #include "supplemental/tls/tls_api.h"
+#include "supplemental/websocket/websocket.h"
 
 static struct {
 	const char *scheme;
@@ -68,6 +69,18 @@ static struct {
 	    .checkopt       = nni_tls_checkopt,
 	},
 	{
+	    .scheme         = "ws",
+	    .dialer_alloc   = nni_ws_dialer_alloc,
+	    .listener_alloc = nni_ws_listener_alloc,
+	    .checkopt       = nni_ws_checkopt,
+	},
+	{
+	    .scheme         = "wss",
+	    .dialer_alloc   = nni_ws_dialer_alloc,
+	    .listener_alloc = nni_ws_listener_alloc,
+	    .checkopt       = nni_ws_checkopt,
+	},
+	{
 	    .scheme = NULL,
 	},
 };
@@ -111,14 +124,6 @@ nni_stream_setx(
 {
 	return (s->s_setx(s, nm, data, sz, t));
 }
-
-/*
-int
-nng_stream_set(nng_stream *s, const char *nm, const void *data, size_t sz)
-{
-        return (nni_stream_setx(s, nm, data, sz, NNI_TYPE_OPAQUE));
-}
-*/
 
 void
 nng_stream_dialer_close(nng_stream_dialer *d)

@@ -18,8 +18,6 @@ typedef struct nni_ws          nni_ws;
 typedef struct nni_ws_listener nni_ws_listener;
 typedef struct nni_ws_dialer   nni_ws_dialer;
 
-typedef int (*nni_ws_listen_hook)(void *, nng_http_req *, nng_http_res *);
-
 // Internal option, not for normal use (at present).  This sets the
 // dialer/listener into message mode.  This is used by the SP transport.
 // This is a boolean.
@@ -33,25 +31,8 @@ typedef int (*nni_ws_listen_hook)(void *, nng_http_req *, nng_http_res *);
 
 // Much of the websocket API is still "private", meeaning you should not
 // rely upon it being around.
-extern int  nni_ws_listener_init(nni_ws_listener **, nni_url *);
-extern void nni_ws_listener_fini(nni_ws_listener *);
-extern void nni_ws_listener_close(nni_ws_listener *);
-extern int  nni_ws_listener_proto(nni_ws_listener *, const char *);
-extern int  nni_ws_listener_listen(nni_ws_listener *);
-extern void nni_ws_listener_accept(nni_ws_listener *, nng_aio *);
-extern void nni_ws_listener_hook(
-    nni_ws_listener *, nni_ws_listen_hook, void *);
-extern int  nni_ws_listener_set_tls(nni_ws_listener *, nng_tls_config *);
-extern int  nni_ws_listener_get_tls(nni_ws_listener *, nng_tls_config **s);
-extern void nni_ws_listener_set_maxframe(nni_ws_listener *, size_t);
-
-extern int nni_ws_dialer_alloc(nng_stream_dialer **, nni_url *);
-
-// Dialer does not get a hook chance, as it can examine the request and reply
-// after dial is done; this is not a 3-way handshake, so the dialer does
-// not confirm the server's response at the HTTP level.  (It can still issue
-// a websocket close).
-
-// The implementation will send periodic PINGs, and respond with PONGs.
+extern int nni_ws_listener_alloc(nng_stream_listener **, const nni_url *);
+extern int nni_ws_dialer_alloc(nng_stream_dialer **, const nni_url *);
+extern int nni_ws_checkopt(const char *, const void *, size_t, nni_type);
 
 #endif // NNG_SUPPLEMENTAL_WEBSOCKET_WEBSOCKET_H

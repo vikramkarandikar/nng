@@ -22,6 +22,9 @@
 
 #include "websocket.h"
 
+// This should be removed or handled differently in the future.
+typedef int (*nni_ws_listen_hook)(void *, nng_http_req *, nng_http_res *);
+
 // We have chosen to be a bit more stringent in the size of the frames that
 // we send, while we more generously allow larger incoming frames.  These
 // may be tuned by options.
@@ -94,6 +97,8 @@ struct nni_ws_listener {
 	void *              hookarg;
 	nni_list            headers; // response headers
 	size_t              maxframe;
+	size_t              fragsize;
+	size_t              recvmax; // largest message size
 };
 
 // The dialer tracks user aios in two lists. The first list is for aios
@@ -114,7 +119,6 @@ struct nni_ws_dialer {
 	nni_list          wspend; // ws structures still negotiating
 	bool              closed;
 	bool              isstream;
-	nng_sockaddr      sa;
 	nni_list          headers; // request headers
 	size_t            maxframe;
 	size_t            fragsize;
@@ -170,6 +174,119 @@ static void ws_str_send(void *, nng_aio *);
 static void ws_str_recv(void *, nng_aio *);
 static int  ws_str_getx(void *, const char *, void *, size_t *, nni_type);
 static int  ws_str_setx(void *, const char *, const void *, size_t, nni_type);
+
+static void ws_listener_close(void *);
+static void ws_listener_free(void *);
+
+static int
+ws_check_string(const void *v, size_t sz, nni_opt_type t)
+{
+	if ((t != NNI_TYPE_OPAQUE) && (t != NNI_TYPE_STRING)) {
+		return (NNG_EBADTYPE);
+	}
+	if (nni_strnlen(v, sz) >= sz) {
+		return (NNG_EINVAL);
+	}
+	return (0);
+}
+
+static int
+ws_set_header_ext(nni_list *l, const char *n, const char *v, bool strip_dups)
+{
+	ws_header *hdr;
+	char *     nv;
+
+	if ((nv = nni_strdup(v)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+
+	if (strip_dups) {
+		NNI_LIST_FOREACH (l, hdr) {
+			if (nni_strcasecmp(hdr->name, n) == 0) {
+				nni_strfree(hdr->value);
+				hdr->value = nv;
+				return (0);
+			}
+		}
+	}
+
+	if ((hdr = NNI_ALLOC_STRUCT(hdr)) == NULL) {
+		nni_strfree(nv);
+		return (NNG_ENOMEM);
+	}
+	if ((hdr->name = nni_strdup(n)) == NULL) {
+		nni_strfree(nv);
+		NNI_FREE_STRUCT(hdr);
+		return (NNG_ENOMEM);
+	}
+	hdr->value = nv;
+	nni_list_append(l, hdr);
+	return (0);
+}
+
+static int
+ws_set_header(nni_list *l, const char *n, const char *v)
+{
+	return (ws_set_header_ext(l, n, v, true));
+}
+
+static int
+ws_set_headers(nni_list *l, const char *str)
+{
+	char * dupstr;
+	size_t duplen;
+	char * n;
+	char * v;
+	char * nl;
+	int    rv;
+
+	if ((dupstr = nni_strdup(str)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	duplen = strlen(dupstr) + 1; // so we can free it later
+
+	n = dupstr;
+	for (;;) {
+		if ((v = strchr(n, ':')) == NULL) {
+			// Note that this also means that if
+			// a bare word is present, we ignore it.
+			break;
+		}
+		*v = '\0';
+		v++;
+		while (*v == ' ') {
+			// Skip leading whitespace.  Not strictly
+			// necessary, but still a good idea.
+			v++;
+		}
+		nl = v;
+		// Find the end of the line -- should be CRLF, but can
+		// also be unterminated or just LF if user
+		while ((*nl != '\0') && (*nl != '\r') && (*nl != '\n')) {
+			nl++;
+		}
+		while ((*nl == '\r') || (*nl == '\n')) {
+			*nl = '\0';
+			nl++;
+		}
+
+		// Note that this can lead to a partial failure.  As this
+		// is most likely ENOMEM, don't worry too much about it.
+		// This method does *not* eliminate duplicates.
+		if ((rv = ws_set_header_ext(l, n, v, false)) != 0) {
+			goto done;
+		}
+
+		// Advance to the next name.
+		n = nl;
+	}
+
+	rv = 0;
+
+done:
+	nni_free(dupstr, duplen);
+	return (rv);
+}
 
 // This looks, case independently for a word in a list, which is either
 // space or comma separated.
@@ -1303,12 +1420,13 @@ ws_init(nni_ws **wsp)
 	return (0);
 }
 
-void
-nni_ws_listener_fini(nni_ws_listener *l)
+static void
+ws_listener_free(void *arg)
 {
-	ws_header *hdr;
+	nni_ws_listener *l = arg;
+	ws_header *      hdr;
 
-	nni_ws_listener_close(l);
+	ws_listener_close(l);
 
 	nni_mtx_lock(&l->mtx);
 	while (!nni_list_empty(&l->reply)) {
@@ -1353,6 +1471,7 @@ ws_handler(nni_aio *aio)
 	uint16_t          status;
 	int               rv;
 	char              key[29];
+	ws_header *       hdr;
 
 	req  = nni_aio_get_input(aio, 0);
 	h    = nni_aio_get_input(aio, 1);
@@ -1439,6 +1558,20 @@ ws_handler(nni_aio *aio)
 		goto err;
 	}
 
+	// Set any user supplied headers.  This is better than using a hook
+	// for most things, because it is loads easier.
+	NNI_LIST_FOREACH (&l->headers, hdr) {
+		if (SETH(hdr->name, hdr->value) != 0) {
+			status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+			nni_http_res_free(res);
+			goto err;
+		}
+	}
+
+	// The hook function gives us the ability to intercept the HTTP
+	// response altogether.  Its best not to do this unless you really
+	// need to, because it's much more complex.  But if you want to set
+	// up an HTTP Authorization handler this might be the only choice.
 	if (l->hookfn != NULL) {
 		rv = l->hookfn(l->hookarg, req, res);
 		if (rv != 0) {
@@ -1501,71 +1634,6 @@ err:
 	}
 }
 
-int
-nni_ws_listener_init(nni_ws_listener **wslp, nni_url *url)
-{
-	nni_ws_listener *l;
-	int              rv;
-	char *           host;
-
-	if ((l = NNI_ALLOC_STRUCT(l)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	nni_mtx_init(&l->mtx);
-	nni_cv_init(&l->cv, &l->mtx);
-	nni_aio_list_init(&l->aios);
-
-	NNI_LIST_INIT(&l->pend, nni_ws, node);
-	NNI_LIST_INIT(&l->reply, nni_ws, node);
-
-	// make a private copy of the url structure.
-	if ((rv = nni_url_clone(&l->url, url)) != 0) {
-		nni_ws_listener_fini(l);
-		return (rv);
-	}
-
-	host = l->url->u_hostname;
-	if (strlen(host) == 0) {
-		host = NULL;
-	}
-	rv = nni_http_handler_init(&l->handler, url->u_path, ws_handler);
-	if (rv != 0) {
-		nni_ws_listener_fini(l);
-		return (rv);
-	}
-
-	if (((rv = nni_http_handler_set_host(l->handler, host)) != 0) ||
-	    ((rv = nni_http_handler_set_data(l->handler, l, 0)) != 0) ||
-	    ((rv = nni_http_server_init(&l->server, url)) != 0)) {
-		nni_ws_listener_fini(l);
-		return (rv);
-	}
-
-	l->maxframe = 0;
-	*wslp       = l;
-	return (0);
-}
-
-int
-nni_ws_listener_proto(nni_ws_listener *l, const char *proto)
-{
-	int   rv = 0;
-	char *ns;
-	nni_mtx_lock(&l->mtx);
-	if (l->started) {
-		rv = NNG_EBUSY;
-	} else if ((ns = nni_strdup(proto)) == NULL) {
-		rv = NNG_ENOMEM;
-	} else {
-		if (l->proto != NULL) {
-			nni_strfree(l->proto);
-		}
-		l->proto = ns;
-	}
-	nni_mtx_unlock(&l->mtx);
-	return (rv);
-}
-
 static void
 ws_accept_cancel(nni_aio *aio, void *arg, int rv)
 {
@@ -1579,11 +1647,12 @@ ws_accept_cancel(nni_aio *aio, void *arg, int rv)
 	nni_mtx_unlock(&l->mtx);
 }
 
-void
-nni_ws_listener_accept(nni_ws_listener *l, nni_aio *aio)
+static void
+ws_listener_accept(void *arg, nni_aio *aio)
 {
-	nni_ws *ws;
-	int     rv;
+	nni_ws_listener *l = arg;
+	nni_ws *         ws;
+	int              rv;
 
 	if (nni_aio_begin(aio) != 0) {
 		return;
@@ -1615,10 +1684,11 @@ nni_ws_listener_accept(nni_ws_listener *l, nni_aio *aio)
 	nni_mtx_unlock(&l->mtx);
 }
 
-void
-nni_ws_listener_close(nni_ws_listener *l)
+static void
+ws_listener_close(void *arg)
 {
-	nni_ws *ws;
+	nni_ws_listener *l = arg;
+	nni_ws *         ws;
 	nni_mtx_lock(&l->mtx);
 	if (l->closed) {
 		nni_mtx_unlock(&l->mtx);
@@ -1639,10 +1709,22 @@ nni_ws_listener_close(nni_ws_listener *l)
 	nni_mtx_unlock(&l->mtx);
 }
 
-int
-nni_ws_listener_listen(nni_ws_listener *l)
+// XXX: Consider replacing this with an option.
+void
+nni_ws_listener_hook(
+    nni_ws_listener *l, nni_ws_listen_hook hookfn, void *hookarg)
 {
-	int rv;
+	nni_mtx_lock(&l->mtx);
+	l->hookfn  = hookfn;
+	l->hookarg = hookarg;
+	nni_mtx_unlock(&l->mtx);
+}
+
+static int
+ws_listener_listen(void *arg)
+{
+	nni_ws_listener *l = arg;
+	int              rv;
 
 	nni_mtx_lock(&l->mtx);
 	if (l->closed) {
@@ -1675,42 +1757,274 @@ nni_ws_listener_listen(nni_ws_listener *l)
 	return (0);
 }
 
-void
-nni_ws_listener_hook(
-    nni_ws_listener *l, nni_ws_listen_hook hookfn, void *hookarg)
+static int
+ws_listener_set_size(
+    nni_ws_listener *l, size_t *valp, const void *buf, size_t sz, nni_type t)
 {
-	nni_mtx_lock(&l->mtx);
-	l->hookfn  = hookfn;
-	l->hookarg = hookarg;
-	nni_mtx_unlock(&l->mtx);
+	size_t val;
+	int    rv;
+
+	// Max size is limited to 4 GB, but you really never want to have
+	// to have a larger value.  If you think you need that, you're doing it
+	// wrong.  You *can* set the size to 0 for unlimited.
+	if ((rv = nni_copyin_size(&val, buf, sz, 0, NNI_MAXSZ, t)) == 0) {
+		nni_mtx_lock(&l->mtx);
+		*valp = val;
+		nni_mtx_unlock(&l->mtx);
+	}
+	return (rv);
 }
 
-int
-nni_ws_listener_set_tls(nni_ws_listener *l, nng_tls_config *tls)
+static int
+ws_listener_get_size(
+    nni_ws_listener *l, size_t *valp, void *buf, size_t *szp, nni_type t)
 {
-	int rv;
+	size_t val;
 	nni_mtx_lock(&l->mtx);
-	rv = nni_http_server_set_tls(l->server, tls);
+	val = *valp;
+	nni_mtx_unlock(&l->mtx);
+	return (nni_copyout_size(val, buf, szp, t));
+}
+
+static int
+ws_listener_set_maxframe(void *arg, const void *buf, size_t sz, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	return (ws_listener_set_size(l, &l->maxframe, buf, sz, t));
+}
+
+static int
+ws_listener_get_maxframe(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	return (ws_listener_get_size(l, &l->maxframe, buf, szp, t));
+}
+
+static int
+ws_listener_set_fragsize(void *arg, const void *buf, size_t sz, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	return (ws_listener_set_size(l, &l->fragsize, buf, sz, t));
+}
+
+static int
+ws_listener_get_fragsize(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	return (ws_listener_get_size(l, &l->fragsize, buf, szp, t));
+}
+
+static int
+ws_listener_set_recvmax(void *arg, const void *buf, size_t sz, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	return (ws_listener_set_size(l, &l->recvmax, buf, sz, t));
+}
+
+static int
+ws_listener_get_recvmax(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	return (ws_listener_get_size(l, &l->recvmax, buf, szp, t));
+}
+
+static int
+ws_listener_set_res_headers(void *arg, const void *buf, size_t sz, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	int              rv;
+
+	if ((rv = ws_check_string(buf, sz, t)) == 0) {
+		nni_mtx_lock(&l->mtx);
+		rv = ws_set_headers(&l->headers, buf);
+		nni_mtx_unlock(&l->mtx);
+	}
+	return (rv);
+}
+
+static int
+ws_listener_set_proto(void *arg, const void *buf, size_t sz, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	int              rv;
+
+	if ((rv = ws_check_string(buf, sz, t)) == 0) {
+		char *ns;
+		if ((ns = nni_strdup(buf)) == NULL) {
+			rv = NNG_ENOMEM;
+		} else {
+			nni_mtx_lock(&l->mtx);
+			if (l->proto != NULL) {
+				nni_strfree(l->proto);
+			}
+			l->proto = ns;
+			nni_mtx_unlock(&l->mtx);
+		}
+	}
+	return (rv);
+}
+
+static int
+ws_listener_get_proto(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	int              rv;
+	nni_mtx_lock(&l->mtx);
+	rv = nni_copyout_str(l->proto != NULL ? l->proto : "", buf, szp, t);
 	nni_mtx_unlock(&l->mtx);
 	return (rv);
 }
 
-int
-nni_ws_listener_get_tls(nni_ws_listener *l, nng_tls_config **tlsp)
+static int
+ws_listener_set_msgmode(void *arg, const void *buf, size_t sz, nni_type t)
 {
-	int rv;
-	nni_mtx_lock(&l->mtx);
-	rv = nni_http_server_get_tls(l->server, tlsp);
-	nni_mtx_unlock(&l->mtx);
+	nni_ws_listener *l = arg;
+	int              rv;
+	bool             b;
+
+	if ((rv = nni_copyin_bool(&b, buf, sz, t)) == 0) {
+		nni_mtx_lock(&l->mtx);
+		l->isstream = !b;
+		nni_mtx_unlock(&l->mtx);
+	}
 	return (rv);
 }
 
-void
-nni_ws_listener_set_maxframe(nni_ws_listener *l, size_t maxframe)
+static const nni_option ws_listener_options[] = {
+	{
+	    .o_name = NNI_OPT_WS_MSGMODE,
+	    .o_set  = ws_listener_set_msgmode,
+	},
+	{
+	    .o_name = NNG_OPT_WS_RECVMAXFRAME,
+	    .o_set  = ws_listener_set_maxframe,
+	    .o_get  = ws_listener_get_maxframe,
+	},
+	{
+	    .o_name = NNG_OPT_WS_SENDMAXFRAME,
+	    .o_set  = ws_listener_set_fragsize,
+	    .o_get  = ws_listener_get_fragsize,
+	},
+	{
+	    .o_name = NNG_OPT_RECVMAXSZ,
+	    .o_set  = ws_listener_set_recvmax,
+	    .o_get  = ws_listener_get_recvmax,
+	},
+	{
+	    .o_name = NNG_OPT_WS_RESPONSE_HEADERS,
+	    .o_set  = ws_listener_set_res_headers,
+	    // XXX: Get not implemented yet; likely of marginal value.
+	},
+	{
+	    .o_name = NNG_OPT_WS_PROTOCOL,
+	    .o_set  = ws_listener_set_proto,
+	    .o_get  = ws_listener_get_proto,
+	},
+	{
+	    .o_name = NULL,
+	},
+};
+
+static int
+ws_listener_set_header(nni_ws_listener *l, const char *name, const void *buf,
+    size_t sz, nni_type t)
 {
-	nni_mtx_lock(&l->mtx);
-	l->maxframe = maxframe;
-	nni_mtx_unlock(&l->mtx);
+	int rv;
+	name += strlen(NNG_OPT_WS_RESPONSE_HEADER);
+	if ((rv = ws_check_string(buf, sz, t)) == 0) {
+		nni_mtx_lock(&l->mtx);
+		rv = ws_set_header(&l->headers, name, buf);
+		nni_mtx_unlock(&l->mtx);
+	}
+	return (rv);
+}
+
+static int
+ws_listener_setx(
+    void *arg, const char *name, const void *buf, size_t sz, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	int              rv;
+
+	rv = nni_setopt(ws_listener_options, name, l, buf, sz, t);
+	if (rv == NNG_ENOTSUP) {
+		rv = nni_http_server_setx(l->server, name, buf, sz, t);
+	}
+
+	if (rv == NNG_ENOTSUP) {
+		if (startswith(name, NNG_OPT_WS_RESPONSE_HEADER)) {
+			rv = ws_listener_set_header(l, name, buf, sz, t);
+		}
+	}
+	return (rv);
+}
+
+static int
+ws_listener_getx(
+    void *arg, const char *name, void *buf, size_t *szp, nni_type t)
+{
+	nni_ws_listener *l = arg;
+	int              rv;
+
+	rv = nni_getopt(ws_listener_options, name, l, buf, szp, t);
+	if (rv == NNG_ENOTSUP) {
+		rv = nni_http_server_getx(l->server, name, buf, szp, t);
+	}
+	return (rv);
+}
+
+int
+nni_ws_listener_alloc(nng_stream_listener **wslp, const nng_url *url)
+{
+	nni_ws_listener *l;
+	int              rv;
+	char *           host;
+
+	if ((l = NNI_ALLOC_STRUCT(l)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	nni_mtx_init(&l->mtx);
+	nni_cv_init(&l->cv, &l->mtx);
+	nni_aio_list_init(&l->aios);
+
+	NNI_LIST_INIT(&l->pend, nni_ws, node);
+	NNI_LIST_INIT(&l->reply, nni_ws, node);
+
+	// make a private copy of the url structure.
+	if ((rv = nni_url_clone(&l->url, url)) != 0) {
+		ws_listener_free(l);
+		return (rv);
+	}
+
+	host = l->url->u_hostname;
+	if (strlen(host) == 0) {
+		host = NULL;
+	}
+	rv = nni_http_handler_init(&l->handler, url->u_path, ws_handler);
+	if (rv != 0) {
+		ws_listener_free(l);
+		return (rv);
+	}
+
+	if (((rv = nni_http_handler_set_host(l->handler, host)) != 0) ||
+	    ((rv = nni_http_handler_set_data(l->handler, l, 0)) != 0) ||
+	    ((rv = nni_http_server_init(&l->server, url)) != 0)) {
+		ws_listener_free(l);
+		return (rv);
+	}
+
+	l->fragsize      = WS_DEF_MAXTXFRAME;
+	l->maxframe      = WS_DEF_MAXRXFRAME;
+	l->recvmax       = WS_DEF_RECVMAX;
+	l->isstream      = false;
+	l->ops.sl_free   = ws_listener_free;
+	l->ops.sl_close  = ws_listener_close;
+	l->ops.sl_accept = ws_listener_accept;
+	l->ops.sl_listen = ws_listener_listen;
+	l->ops.sl_setx   = ws_listener_setx;
+	l->ops.sl_getx   = ws_listener_getx;
+	*wslp            = (void *) l;
+	return (0);
 }
 
 void
@@ -1907,116 +2221,6 @@ ws_dialer_dial(void *arg, nni_aio *aio)
 	nni_list_append(&d->wspend, ws);
 	nni_http_client_connect(d->client, ws->connaio);
 	nni_mtx_unlock(&d->mtx);
-}
-
-static int
-ws_check_string(const void *v, size_t sz, nni_opt_type t)
-{
-	if ((t != NNI_TYPE_OPAQUE) && (t != NNI_TYPE_STRING)) {
-		return (NNG_EBADTYPE);
-	}
-	if (nni_strnlen(v, sz) >= sz) {
-		return (NNG_EINVAL);
-	}
-	return (0);
-}
-
-static int
-ws_set_header_ext(nni_list *l, const char *n, const char *v, bool strip_dups)
-{
-	ws_header *hdr;
-	char *     nv;
-
-	if ((nv = nni_strdup(v)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-
-	if (strip_dups) {
-		NNI_LIST_FOREACH (l, hdr) {
-			if (nni_strcasecmp(hdr->name, n) == 0) {
-				nni_strfree(hdr->value);
-				hdr->value = nv;
-				return (0);
-			}
-		}
-	}
-
-	if ((hdr = NNI_ALLOC_STRUCT(hdr)) == NULL) {
-		nni_strfree(nv);
-		return (NNG_ENOMEM);
-	}
-	if ((hdr->name = nni_strdup(n)) == NULL) {
-		nni_strfree(nv);
-		NNI_FREE_STRUCT(hdr);
-		return (NNG_ENOMEM);
-	}
-	hdr->value = nv;
-	nni_list_append(l, hdr);
-	return (0);
-}
-
-static int
-ws_set_header(nni_list *l, const char *n, const char *v)
-{
-	return (ws_set_header_ext(l, n, v, true));
-}
-
-static int
-ws_set_headers(nni_list *l, const char *str)
-{
-	char * dupstr;
-	size_t duplen;
-	char * n;
-	char * v;
-	char * nl;
-	int    rv;
-
-	if ((dupstr = nni_strdup(str)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	duplen = strlen(dupstr) + 1; // so we can free it later
-
-	n = dupstr;
-	for (;;) {
-		if ((v = strchr(n, ':')) == NULL) {
-			// Note that this also means that if
-			// a bare word is present, we ignore it.
-			break;
-		}
-		*v = '\0';
-		v++;
-		while (*v == ' ') {
-			// Skip leading whitespace.  Not strictly
-			// necessary, but still a good idea.
-			v++;
-		}
-		nl = v;
-		// Find the end of the line -- should be CRLF, but can
-		// also be unterminated or just LF if user
-		while ((*nl != '\0') && (*nl != '\r') && (*nl != '\n')) {
-			nl++;
-		}
-		while ((*nl == '\r') || (*nl == '\n')) {
-			*nl = '\0';
-			nl++;
-		}
-
-		// Note that this can lead to a partial failure.  As this
-		// is most likely ENOMEM, don't worry too much about it.
-		// This method does *not* eliminate duplicates.
-		if ((rv = ws_set_header_ext(l, n, v, false)) != 0) {
-			goto done;
-		}
-
-		// Advance to the next name.
-		n = nl;
-	}
-
-	rv = 0;
-
-done:
-	nni_free(dupstr, duplen);
-	return (rv);
 }
 
 static int
@@ -2235,7 +2439,7 @@ ws_dialer_getx(void *arg, const char *name, void *buf, size_t *szp, nni_type t)
 }
 
 int
-ws_dialer_alloc(nng_stream_dialer **dp, nni_url *url, bool isstream)
+nni_ws_dialer_alloc(nng_stream_dialer **dp, const nng_url *url)
 {
 	nni_ws_dialer *d;
 	int            rv;
@@ -2257,7 +2461,7 @@ ws_dialer_alloc(nng_stream_dialer **dp, nni_url *url, bool isstream)
 		ws_dialer_free(d);
 		return (rv);
 	}
-	d->isstream = isstream;
+	d->isstream = true;
 	d->recvmax  = WS_DEF_RECVMAX;
 	d->maxframe = WS_DEF_MAXRXFRAME;
 	d->fragsize = WS_DEF_MAXTXFRAME;
@@ -2269,12 +2473,6 @@ ws_dialer_alloc(nng_stream_dialer **dp, nni_url *url, bool isstream)
 	d->ops.sd_getx  = ws_dialer_getx;
 	*dp             = (void *) d;
 	return (0);
-}
-
-int
-nni_ws_dialer_alloc(nng_stream_dialer **dp, nni_url *url)
-{
-	return (ws_dialer_alloc(dp, url, true));
 }
 
 // Dialer does not get a hook chance, as it can examine the request

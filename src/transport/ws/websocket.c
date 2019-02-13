@@ -1,7 +1,7 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
-// Copyright 2018 Devolutions <info@devolutions.net>
+// Copyright 2019 Devolutions <info@devolutions.net>
 //
 // This software is supplied under the terms of the MIT License, a
 // copy of which should be located in the distribution where this
@@ -35,7 +35,6 @@ typedef struct ws_hdr {
 struct ws_dialer {
 	uint16_t           lproto; // local protocol
 	uint16_t           rproto; // remote protocol
-	size_t             rcvmax;
 	char *             prname;
 	nni_list           aios;
 	nni_mtx            mtx;
@@ -47,31 +46,28 @@ struct ws_dialer {
 };
 
 struct ws_listener {
-	uint16_t         lproto; // local protocol
-	uint16_t         rproto; // remote protocol
-	size_t           rcvmax;
-	char *           prname;
-	nni_list         aios;
-	nni_mtx          mtx;
-	nni_aio *        accaio;
-	nni_ws_listener *listener;
-	nni_list         headers; // res headers
-	bool             started;
-	nni_listener *   nlistener;
+	uint16_t             lproto; // local protocol
+	uint16_t             rproto; // remote protocol
+	char *               prname;
+	nni_list             aios;
+	nni_mtx              mtx;
+	nni_aio *            accaio;
+	nng_stream_listener *listener;
+	nni_list             headers; // res headers
+	bool                 started;
+	nni_listener *       nlistener;
 };
 
 struct ws_pipe {
-	nni_mtx   mtx;
-	nni_pipe *npipe;
-	size_t    rcvmax;
-	bool      closed;
-	uint16_t  rproto;
-	uint16_t  lproto;
-	nni_aio * user_txaio;
-	nni_aio * user_rxaio;
-	nni_aio * txaio;
-	nni_aio * rxaio;
-	// nni_ws *  ws;
+	nni_mtx     mtx;
+	nni_pipe *  npipe;
+	bool        closed;
+	uint16_t    rproto;
+	uint16_t    lproto;
+	nni_aio *   user_txaio;
+	nni_aio *   user_rxaio;
+	nni_aio *   txaio;
+	nni_aio *   rxaio;
 	nng_stream *ws;
 };
 
@@ -271,39 +267,13 @@ ws_pipe_peer(void *arg)
 	return (p->rproto);
 }
 
-// We have very different approaches for server and client.
-// Servers use the HTTP server framework, and a request methodology.
-
-static int
-ws_hook(void *arg, nni_http_req *req, nni_http_res *res)
-{
-	ws_listener *l = arg;
-	ws_hdr *     h;
-	NNI_ARG_UNUSED(req);
-
-	// Eventually we'll want user customizable hooks.
-	// For now we just set the headers we want.
-
-	NNI_LIST_FOREACH (&l->headers, h) {
-		int rv;
-		rv = nng_http_res_set_header(res, h->name, h->value);
-		if (rv != 0) {
-			return (rv);
-		}
-	}
-	return (0);
-}
-
 static int
 ws_listener_bind(void *arg)
 {
 	ws_listener *l = arg;
 	int          rv;
 
-	nni_ws_listener_set_maxframe(l->listener, l->rcvmax);
-	nni_ws_listener_hook(l->listener, ws_hook, l);
-
-	if ((rv = nni_ws_listener_listen(l->listener)) == 0) {
+	if ((rv = nng_stream_listener_listen(l->listener)) == 0) {
 		l->started = true;
 	}
 	return (rv);
@@ -342,7 +312,7 @@ ws_listener_accept(void *arg, nni_aio *aio)
 	}
 	nni_list_append(&l->aios, aio);
 	if (aio == nni_list_first(&l->aios)) {
-		nni_ws_listener_accept(l->listener, l->accaio);
+		nng_stream_listener_accept(l->listener, l->accaio);
 	}
 	nni_mtx_unlock(&l->mtx);
 }
@@ -383,142 +353,6 @@ ws_dialer_connect(void *arg, nni_aio *aio)
 	nni_mtx_unlock(&d->mtx);
 }
 
-static int
-ws_check_string(const void *v, size_t sz, nni_opt_type t)
-{
-	if ((t != NNI_TYPE_OPAQUE) && (t != NNI_TYPE_STRING)) {
-		return (NNG_EBADTYPE);
-	}
-	if (nni_strnlen(v, sz) >= sz) {
-		return (NNG_EINVAL);
-	}
-	return (0);
-}
-
-static int
-ws_listener_set_recvmaxsz(void *arg, const void *v, size_t sz, nni_opt_type t)
-{
-	ws_listener *l = arg;
-	size_t       val;
-	int          rv;
-
-	if (((rv = nni_copyin_size(&val, v, sz, 0, NNI_MAXSZ, t)) == 0) &&
-	    (l != NULL)) {
-		nni_mtx_lock(&l->mtx);
-		l->rcvmax = val;
-		nni_mtx_unlock(&l->mtx);
-		nni_ws_listener_set_maxframe(l->listener, val);
-	}
-	return (rv);
-}
-
-static int
-ws_listener_get_recvmaxsz(void *arg, void *v, size_t *szp, nni_opt_type t)
-{
-	ws_listener *l = arg;
-	int          rv;
-	nni_mtx_lock(&l->mtx);
-	rv = nni_copyout_size(l->rcvmax, v, szp, t);
-	nni_mtx_unlock(&l->mtx);
-	return (rv);
-}
-
-static int
-ws_set_headers(nni_list *headers, const char *v)
-{
-	char *   dupstr;
-	size_t   duplen;
-	char *   name;
-	char *   value;
-	char *   nl;
-	nni_list l;
-	ws_hdr * h;
-	int      rv;
-
-	NNI_LIST_INIT(&l, ws_hdr, node);
-	if ((dupstr = nni_strdup(v)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	duplen = strlen(dupstr) + 1; // so we can free it later
-	name   = dupstr;
-	for (;;) {
-		if ((value = strchr(name, ':')) == NULL) {
-			// Note that this also means that if
-			// a bare word is present, we ignore it.
-			break;
-		}
-		*value = '\0';
-		value++;
-		while (*value == ' ') {
-			// Skip leading whitespace.  Not strictly
-			// necessary, but still a good idea.
-			value++;
-		}
-		nl = value;
-		// Find the end of the line -- should be CRLF, but can
-		// also be unterminated or just LF if user
-		while ((*nl != '\0') && (*nl != '\r') && (*nl != '\n')) {
-			nl++;
-		}
-		while ((*nl == '\r') || (*nl == '\n')) {
-			*nl = '\0';
-			nl++;
-		}
-
-		if ((h = NNI_ALLOC_STRUCT(h)) == NULL) {
-			rv = NNG_ENOMEM;
-			goto done;
-		}
-		nni_list_append(&l, h);
-		if (((h->name = nni_strdup(name)) == NULL) ||
-		    ((h->value = nni_strdup(value)) == NULL)) {
-			rv = NNG_ENOMEM;
-			goto done;
-		}
-
-		name = nl;
-	}
-
-	while ((h = nni_list_first(headers)) != NULL) {
-		nni_list_remove(headers, h);
-		nni_strfree(h->name);
-		nni_strfree(h->value);
-		NNI_FREE_STRUCT(h);
-	}
-	while ((h = nni_list_first(&l)) != NULL) {
-		nni_list_remove(&l, h);
-		nni_list_append(headers, h);
-	}
-	rv = 0;
-
-done:
-	while ((h = nni_list_first(&l)) != NULL) {
-		nni_list_remove(&l, h);
-		nni_strfree(h->name);
-		nni_strfree(h->value);
-		NNI_FREE_STRUCT(h);
-	}
-	nni_free(dupstr, duplen);
-	return (rv);
-}
-
-static int
-ws_listener_set_reshdrs(void *arg, const void *v, size_t sz, nni_opt_type t)
-{
-	ws_listener *l = arg;
-	int          rv;
-
-	if (((rv = ws_check_string(v, sz, t)) == 0) && (l != NULL)) {
-		if (l->started) {
-			return (NNG_EBUSY);
-		}
-		nni_mtx_lock(&l->mtx);
-		rv = ws_set_headers(&l->headers, v);
-		nni_mtx_unlock(&l->mtx);
-	}
-	return (rv);
-}
-
 static const nni_option ws_pipe_options[] = {
 	// terminate list
 	{
@@ -549,22 +383,6 @@ static nni_tran_pipe_ops ws_pipe_ops = {
 	.p_getopt = ws_pipe_getopt,
 };
 
-static nni_option ws_listener_options[] = {
-	{
-	    .o_name = NNG_OPT_RECVMAXSZ,
-	    .o_get  = ws_listener_get_recvmaxsz,
-	    .o_set  = ws_listener_set_recvmaxsz,
-	},
-	{
-	    .o_name = NNG_OPT_WS_RESPONSE_HEADERS,
-	    .o_set  = ws_listener_set_reshdrs,
-	},
-	// terminate list
-	{
-	    .o_name = NULL,
-	},
-};
-
 static void
 ws_dialer_fini(void *arg)
 {
@@ -592,9 +410,7 @@ ws_listener_fini(void *arg)
 	ws_hdr *     hdr;
 
 	nni_aio_stop(l->accaio);
-	if (l->listener != NULL) {
-		nni_ws_listener_fini(l->listener);
-	}
+	nng_stream_listener_free(l->listener);
 	nni_aio_fini(l->accaio);
 	while ((hdr = nni_list_first(&l->headers)) != NULL) {
 		nni_list_remove(&l->headers, hdr);
@@ -635,7 +451,6 @@ ws_connect_cb(void *arg)
 		nng_stream_free(ws);
 		nni_aio_finish_error(uaio, rv);
 	} else {
-		p->rcvmax = d->rcvmax;
 		p->rproto = d->rproto;
 		p->lproto = d->lproto;
 
@@ -646,7 +461,7 @@ ws_connect_cb(void *arg)
 }
 
 static void
-ws_dialer_close(void *arg)
+wstran_dialer_close(void *arg)
 {
 	ws_dialer *d = arg;
 
@@ -655,12 +470,12 @@ ws_dialer_close(void *arg)
 }
 
 static void
-ws_listener_close(void *arg)
+wstran_listener_close(void *arg)
 {
 	ws_listener *l = arg;
 
 	nni_aio_close(l->accaio);
-	nni_ws_listener_close(l->listener);
+	nng_stream_listener_close(l->listener);
 }
 
 static void
@@ -688,7 +503,6 @@ ws_accept_cb(void *arg)
 				nng_stream_close(ws);
 				nni_aio_finish_error(uaio, rv);
 			} else {
-				p->rcvmax = l->rcvmax;
 				p->rproto = l->rproto;
 				p->lproto = l->lproto;
 
@@ -698,12 +512,10 @@ ws_accept_cb(void *arg)
 		}
 	}
 	if (!nni_list_empty(&l->aios)) {
-		nni_ws_listener_accept(l->listener, aaio);
+		nng_stream_listener_accept(l->listener, aaio);
 	}
 	nni_mtx_unlock(&l->mtx);
 }
-
-#define WSPROTO ( NNG_OPT_WS_REQUEST_HEADER "Sec"
 
 static int
 ws_dialer_init(void **dp, nni_url *url, nni_dialer *ndialer)
@@ -762,10 +574,13 @@ ws_listener_init(void **lp, nni_url *url, nni_listener *nlistener)
 	n            = nni_sock_proto_name(sock);
 	l->nlistener = nlistener;
 
-	if (((rv = nni_ws_listener_init(&l->listener, url)) != 0) ||
+	if (((rv = nni_ws_listener_alloc(&l->listener, url)) != 0) ||
 	    ((rv = nni_aio_init(&l->accaio, ws_accept_cb, l)) != 0) ||
+	    ((rv = nng_stream_listener_set_bool(
+	          l->listener, NNI_OPT_WS_MSGMODE, true)) != 0) ||
 	    ((rv = nni_asprintf(&l->prname, "%s.sp.nanomsg.org", n)) != 0) ||
-	    ((rv = nni_ws_listener_proto(l->listener, l->prname)) != 0)) {
+	    ((rv = nng_stream_listener_set_string(
+	          l->listener, NNG_OPT_WS_PROTOCOL, l->prname)) != 0)) {
 		ws_listener_fini(l);
 		return (rv);
 	}
@@ -825,6 +640,34 @@ wstran_dialer_setopt(
 	return (rv);
 }
 
+static int
+wstran_listener_getopt(
+    void *arg, const char *name, void *buf, size_t *szp, nni_type t)
+{
+	ws_listener *l = arg;
+	int          rv;
+
+	rv = nni_stream_listener_getx(l->listener, name, buf, szp, t);
+	if (rv == NNG_ENOTSUP) {
+		rv = nni_getopt(wstran_ep_opts, name, l, buf, szp, t);
+	}
+	return (rv);
+}
+
+static int
+wstran_listener_setopt(
+    void *arg, const char *name, const void *buf, size_t sz, nni_type t)
+{
+	ws_listener *l = arg;
+	int          rv;
+
+	rv = nni_stream_listener_setx(l->listener, name, buf, sz, t);
+	if (rv == NNG_ENOTSUP) {
+		rv = nni_setopt(wstran_ep_opts, name, l, buf, sz, t);
+	}
+	return (rv);
+}
+
 static nni_chkoption wstran_checkopts[] = {
 	{
 	    .o_name = NULL,
@@ -846,18 +689,19 @@ static nni_tran_dialer_ops ws_dialer_ops = {
 	.d_init    = ws_dialer_init,
 	.d_fini    = ws_dialer_fini,
 	.d_connect = ws_dialer_connect,
-	.d_close   = ws_dialer_close,
+	.d_close   = wstran_dialer_close,
 	.d_setopt  = wstran_dialer_setopt,
 	.d_getopt  = wstran_dialer_getopt,
 };
 
 static nni_tran_listener_ops ws_listener_ops = {
-	.l_init    = ws_listener_init,
-	.l_fini    = ws_listener_fini,
-	.l_bind    = ws_listener_bind,
-	.l_accept  = ws_listener_accept,
-	.l_close   = ws_listener_close,
-	.l_options = ws_listener_options,
+	.l_init   = ws_listener_init,
+	.l_fini   = ws_listener_fini,
+	.l_bind   = ws_listener_bind,
+	.l_accept = ws_listener_accept,
+	.l_close  = wstran_listener_close,
+	.l_setopt = wstran_listener_setopt,
+	.l_getopt = wstran_listener_getopt,
 };
 
 static nni_tran ws_tran = {
@@ -879,155 +723,11 @@ nng_ws_register(void)
 
 #ifdef NNG_TRANSPORT_WSS
 
-static int
-wss_listener_get_tlsconfig(void *arg, void *v, size_t *szp, nni_opt_type t)
-{
-	ws_listener *   l = arg;
-	nng_tls_config *tls;
-	int             rv;
-
-	if (((rv = nni_ws_listener_get_tls(l->listener, &tls)) != 0) ||
-	    ((rv = nni_copyout_ptr(tls, v, szp, t)) != 0)) {
-		return (rv);
-	}
-	return (0);
-}
-
-static int
-wss_listener_set_tlsconfig(void *arg, const void *v, size_t sz, nni_opt_type t)
-{
-	ws_listener *   l = arg;
-	nng_tls_config *cfg;
-	int             rv;
-
-	if ((rv = nni_copyin_ptr((void **) &cfg, v, sz, t)) != 0) {
-		return (rv);
-	}
-	if (cfg == NULL) {
-		return (NNG_EINVAL);
-	}
-	if (l != NULL) {
-		rv = nni_ws_listener_set_tls(l->listener, cfg);
-	}
-	return (rv);
-}
-
-static int
-wss_listener_set_cert_key_file(
-    void *arg, const void *v, size_t sz, nni_opt_type t)
-{
-	ws_listener *l = arg;
-	int          rv;
-
-	if (((rv = ws_check_string(v, sz, t)) == 0) && (l != NULL)) {
-		nng_tls_config *tls;
-
-		if ((rv = nni_ws_listener_get_tls(l->listener, &tls)) != 0) {
-			return (rv);
-		}
-		rv = nng_tls_config_cert_key_file(tls, v, NULL);
-		nni_tls_config_fini(tls);
-	}
-	return (rv);
-}
-
-static int
-wss_listener_set_ca_file(void *arg, const void *v, size_t sz, nni_opt_type t)
-{
-	ws_listener *l = arg;
-	int          rv;
-
-	if (((rv = ws_check_string(v, sz, t)) == 0) && (l != NULL)) {
-		nng_tls_config *tls;
-
-		if ((rv = nni_ws_listener_get_tls(l->listener, &tls)) != 0) {
-			return (rv);
-		}
-		rv = nng_tls_config_ca_file(tls, v);
-		nni_tls_config_fini(tls);
-	}
-	return (rv);
-}
-
-static int
-wss_listener_set_auth_mode(void *arg, const void *v, size_t sz, nni_opt_type t)
-{
-	ws_listener *l = arg;
-	int          rv;
-	int          mode;
-
-	rv = nni_copyin_int(&mode, v, sz, NNG_TLS_AUTH_MODE_NONE,
-	    NNG_TLS_AUTH_MODE_REQUIRED, t);
-
-	if ((rv == 0) && (l != NULL)) {
-		nng_tls_config *tls;
-
-		if ((rv = nni_ws_listener_get_tls(l->listener, &tls)) != 0) {
-			return (rv);
-		}
-		rv = nng_tls_config_auth_mode(tls, mode);
-		nni_tls_config_fini(tls);
-	}
-	return (rv);
-}
-
-static nni_option wss_listener_options[] = {
-	{
-	    .o_name = NNG_OPT_RECVMAXSZ,
-	    .o_get  = ws_listener_get_recvmaxsz,
-	    .o_set  = ws_listener_set_recvmaxsz,
-	},
-	{
-	    .o_name = NNG_OPT_WS_RESPONSE_HEADERS,
-	    .o_set  = ws_listener_set_reshdrs,
-	},
-	{
-	    .o_name = NNG_OPT_TLS_CONFIG,
-	    .o_get  = wss_listener_get_tlsconfig,
-	    .o_set  = wss_listener_set_tlsconfig,
-	},
-	{
-	    .o_name = NNG_OPT_TLS_CERT_KEY_FILE,
-	    .o_set  = wss_listener_set_cert_key_file,
-	},
-	{
-	    .o_name = NNG_OPT_TLS_CA_FILE,
-	    .o_set  = wss_listener_set_ca_file,
-	},
-	{
-	    .o_name = NNG_OPT_TLS_AUTH_MODE,
-	    .o_set  = wss_listener_set_auth_mode,
-	},
-	// terminate list
-	{
-	    .o_name = NULL,
-	},
-};
-
-static nni_tran_dialer_ops wss_dialer_ops = {
-	.d_init    = ws_dialer_init,
-	.d_fini    = ws_dialer_fini,
-	.d_connect = ws_dialer_connect,
-	.d_close   = ws_dialer_close,
-	.d_setopt  = wstran_dialer_setopt,
-	.d_getopt  = wstran_dialer_getopt,
-
-};
-
-static nni_tran_listener_ops wss_listener_ops = {
-	.l_init    = ws_listener_init,
-	.l_fini    = ws_listener_fini,
-	.l_bind    = ws_listener_bind,
-	.l_accept  = ws_listener_accept,
-	.l_close   = ws_listener_close,
-	.l_options = wss_listener_options,
-};
-
 static nni_tran wss_tran = {
 	.tran_version  = NNI_TRANSPORT_VERSION,
 	.tran_scheme   = "wss",
-	.tran_dialer   = &wss_dialer_ops,
-	.tran_listener = &wss_listener_ops,
+	.tran_dialer   = &ws_dialer_ops,
+	.tran_listener = &ws_listener_ops,
 	.tran_pipe     = &ws_pipe_ops,
 	.tran_init     = ws_tran_init,
 	.tran_fini     = ws_tran_fini,
