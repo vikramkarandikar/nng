@@ -162,6 +162,21 @@ nni_http_client_get_tls(nni_http_client *c, nng_tls_config **tlsp)
 	return (rv);
 }
 
+int
+nni_http_client_setx(nni_http_client *c, const char *name, const void *buf,
+    size_t sz, nni_type t)
+{
+	// We have no local options, but we just pass them straight through.
+	return (nni_stream_dialer_setx(c->dialer, name, buf, sz, t));
+}
+
+int
+nni_http_client_getx(
+    nni_http_client *c, const char *name, void *buf, size_t *szp, nni_type t)
+{
+	return (nni_stream_dialer_getx(c->dialer, name, buf, szp, t));
+}
+
 static void
 http_dial_cancel(nni_aio *aio, void *arg, int rv)
 {

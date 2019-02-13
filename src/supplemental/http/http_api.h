@@ -1,7 +1,7 @@
 //
 // Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
-// Copyright 2018 Devolutions <info@devolutions.net>
+// Copyright 2019 Devolutions <info@devolutions.net>
 //
 // This software is supplied under the terms of the MIT License, a
 // copy of which should be located in the distribution where this
@@ -205,6 +205,11 @@ extern int nni_http_server_set_tls(nni_http_server *, struct nng_tls_config *);
 extern int nni_http_server_get_tls(
     nni_http_server *, struct nng_tls_config **);
 
+extern int nni_http_server_setx(
+    nni_http_server *, const char *, const void *, size_t, nni_type);
+extern int nni_http_server_getx(
+    nni_http_server *, const char *, void *, size_t *, nni_type);
+
 // nni_http_server_start starts listening on the supplied port.
 extern int nni_http_server_start(nni_http_server *);
 
@@ -347,6 +352,11 @@ extern int nni_http_client_set_tls(nni_http_client *, struct nng_tls_config *);
 // be invalidated by any future calls to nni_http_client_set_tls.
 extern int nni_http_client_get_tls(
     nni_http_client *, struct nng_tls_config **);
+
+extern int nni_http_client_setx(
+    nni_http_client *, const char *, const void *, size_t, nni_type);
+extern int nni_http_client_getx(
+    nni_http_client *, const char *, void *, size_t *, nni_type);
 
 extern void nni_http_client_connect(nni_http_client *, nni_aio *);
 

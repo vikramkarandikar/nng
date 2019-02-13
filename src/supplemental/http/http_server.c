@@ -1747,6 +1747,21 @@ nni_http_server_get_tls(nni_http_server *s, nng_tls_config **tlsp)
 	return (rv);
 }
 
+int
+nni_http_server_setx(nni_http_server *s, const char *name, const void *buf,
+    size_t sz, nni_type t)
+{
+	// We have no local options, but we just pass them straight through.
+	return (nni_stream_listener_setx(s->listener, name, buf, sz, t));
+}
+
+int
+nni_http_server_getx(
+    nni_http_server *s, const char *name, void *buf, size_t *szp, nni_type t)
+{
+	return (nni_stream_listener_getx(s->listener, name, buf, szp, t));
+}
+
 void
 nni_http_server_fini(nni_http_server *s)
 {
