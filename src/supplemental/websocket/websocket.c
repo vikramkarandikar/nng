@@ -914,13 +914,14 @@ ws_read_finish_msg(nni_ws *ws)
 static void
 ws_read_frame_cb(nni_ws *ws, ws_frame *frame)
 {
+	bool final = false;
 	switch (frame->op) {
 	case WS_CONT:
 		if (!ws->inmsg) {
 			ws_close(ws, WS_CLOSE_PROTOCOL_ERR);
 			return;
 		}
-		if (frame->final) {
+		if ((final = frame->final)) {
 			ws->inmsg = false;
 		}
 		ws->rxframe = NULL;
@@ -931,7 +932,7 @@ ws_read_frame_cb(nni_ws *ws, ws_frame *frame)
 			ws_close(ws, WS_CLOSE_PROTOCOL_ERR);
 			return;
 		}
-		if (!frame->final) {
+		if (!(final = frame->final)) {
 			ws->inmsg = true;
 		}
 		ws->rxframe = NULL;
@@ -970,7 +971,7 @@ ws_read_frame_cb(nni_ws *ws, ws_frame *frame)
 
 	if (ws->isstream) {
 		ws_read_finish_str(ws);
-	} else {
+	} else if (final) {
 		ws_read_finish_msg(ws);
 	}
 }
@@ -1613,6 +1614,8 @@ ws_handler(nni_aio *aio)
 	ws->res      = res;
 	ws->server   = true;
 	ws->maxframe = l->maxframe;
+	ws->fragsize = l->fragsize;
+	ws->recvmax  = l->recvmax;
 	ws->isstream = l->isstream;
 
 	// XXX: Inherit fragmentation? (Frag is limited for now).
