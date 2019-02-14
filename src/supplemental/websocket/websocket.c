@@ -1618,8 +1618,6 @@ ws_handler(nni_aio *aio)
 	ws->recvmax  = l->recvmax;
 	ws->isstream = l->isstream;
 
-	// XXX: Inherit fragmentation? (Frag is limited for now).
-
 	nni_list_append(&l->reply, ws);
 	nni_aio_set_data(ws->httpaio, 0, l);
 	nni_http_write_res(conn, res, ws->httpaio);
