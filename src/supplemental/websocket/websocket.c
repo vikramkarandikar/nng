@@ -912,16 +912,25 @@ ws_read_finish_msg(nni_ws *ws)
 }
 
 static void
+ws_read_finish(nni_ws *ws)
+{
+	if (ws->isstream) {
+		ws_read_finish_str(ws);
+	} else {
+		ws_read_finish_msg(ws);
+	}
+}
+
+static void
 ws_read_frame_cb(nni_ws *ws, ws_frame *frame)
 {
-	bool final = false;
 	switch (frame->op) {
 	case WS_CONT:
 		if (!ws->inmsg) {
 			ws_close(ws, WS_CLOSE_PROTOCOL_ERR);
 			return;
 		}
-		if ((final = frame->final)) {
+		if (frame->final) {
 			ws->inmsg = false;
 		}
 		ws->rxframe = NULL;
@@ -932,7 +941,7 @@ ws_read_frame_cb(nni_ws *ws, ws_frame *frame)
 			ws_close(ws, WS_CLOSE_PROTOCOL_ERR);
 			return;
 		}
-		if (!(final = frame->final)) {
+		if (!frame->final) {
 			ws->inmsg = true;
 		}
 		ws->rxframe = NULL;
@@ -969,11 +978,7 @@ ws_read_frame_cb(nni_ws *ws, ws_frame *frame)
 		return;
 	}
 
-	if (ws->isstream) {
-		ws_read_finish_str(ws);
-	} else if (final) {
-		ws_read_finish_msg(ws);
-	}
+	ws_read_finish(ws);
 }
 
 static void
@@ -2579,6 +2584,9 @@ ws_str_recv(void *arg, nng_aio *aio)
 		return;
 	}
 	nni_list_append(&ws->recvq, aio);
+	if (nni_list_first(&ws->recvq) == aio) {
+		ws_read_finish_msg(ws);
+	}
 	ws_start_read(ws);
 
 	nni_mtx_unlock(&ws->mtx);
